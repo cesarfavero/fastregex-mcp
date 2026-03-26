@@ -4,6 +4,8 @@ Fast Regex Search Universal V1 (MCP-first, Rust, PCRE2) with local commit-anchor
 
 Projeto idealizado e liderado por **Cesar Favero**.
 
+Contribuições são bem-vindas via issues e PRs, mas **o merge é sempre aprovado manualmente pelo autor**. Veja `CONTRIBUTING.md`.
+
 ## Why this exists
 
 Agent loops often call `rg` repeatedly and full-scan large monorepos. This project replaces that default with an indexed regex search path:
