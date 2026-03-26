@@ -6,6 +6,7 @@ use anyhow::{Context, Result, anyhow};
 use fastregex_core::{Engine, EngineConfig, RebuildMode, SearchOptions};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::time::Duration;
 
 #[derive(Debug, Deserialize)]
 struct RpcRequest {
@@ -49,6 +50,7 @@ fn main() -> Result<()> {
                         "fastregex index stale, starting background rebuild"
                     );
                     let _ = engine.index_rebuild(RebuildMode::Background);
+                    spawn_rebuild_logger(engine.clone());
                 }
             }
             Err(err) => {
@@ -151,7 +153,9 @@ fn handle_notification(engine: &Engine, request: &RpcRequest) -> Result<()> {
 
 fn handle_request(engine: &Engine, request: RpcRequest) -> Result<Value> {
     match request.method.as_str() {
-        "initialize" => Ok(json!({
+        "initialize" => {
+            let status = engine.index_status().ok();
+            Ok(json!({
             "protocolVersion": "2025-11-05",
             "capabilities": {
                 "tools": {}
@@ -159,8 +163,10 @@ fn handle_request(engine: &Engine, request: RpcRequest) -> Result<Value> {
             "serverInfo": {
                 "name": "fastregex-mcp",
                 "version": env!("CARGO_PKG_VERSION")
-            }
-        })),
+            },
+            "indexStatus": status
+        }))
+        }
         "tools/list" => Ok(json!({
             "tools": tools_manifest()
         })),
@@ -203,6 +209,43 @@ fn handle_request(engine: &Engine, request: RpcRequest) -> Result<Value> {
         }
         other => Err(anyhow!("method not found: {other}")),
     }
+}
+
+fn spawn_rebuild_logger(engine: Engine) {
+    std::thread::spawn(move || {
+        let mut last_generation = None;
+        loop {
+            std::thread::sleep(Duration::from_secs(1));
+            let status = match engine.index_status() {
+                Ok(status) => status,
+                Err(_) => continue,
+            };
+
+            if last_generation.is_none() {
+                last_generation = Some(status.base_generation);
+            }
+
+            if status.freshness == "fresh" {
+                tracing::info!(
+                    base_commit = %status.base_commit,
+                    overlay_dirty_files = status.overlay_dirty_files,
+                    "fastregex index rebuild complete"
+                );
+                break;
+            }
+
+            if let Some(prev) = last_generation {
+                if status.base_generation > prev {
+                    tracing::info!(
+                        base_commit = %status.base_commit,
+                        overlay_dirty_files = status.overlay_dirty_files,
+                        "fastregex index rebuild complete"
+                    );
+                    break;
+                }
+            }
+        }
+    });
 }
 
 fn dispatch_tool(engine: &Engine, name: &str, args: Value) -> Result<Value> {
