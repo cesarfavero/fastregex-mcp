@@ -78,6 +78,19 @@ Notes:
 - This does not upload code anywhere. Indexing is local.
 - `regex_search` handles literal phrases automatically and is fast by default.
 
+## AI install guide (when user sends a repo link)
+
+Use this checklist when an AI agent is asked to install FastRegex for a repo:
+
+1. Clone the target repo (if a URL was provided).
+2. Clone `fastregex-mcp` locally (side-by-side or inside the repo as `.fastregex-mcp`).
+3. Run the MCP pointing at the repo path.
+4. Instruct the model to use `regex_search` for all code search.
+
+Skill file (for Smithery or similar tools):
+
+- `wrappers/skills/fastregex-install/SKILL.md`
+
 ## MCP API
 
 - `regex_search(pattern, options)`
