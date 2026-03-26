@@ -71,7 +71,7 @@ fn main() -> Result<()> {
             pattern: "alpha_service_endpoint|gamma_worker_token",
         },
         QueryCase {
-            name: "Class-heavy (fallback)",
+            name: "Class-heavy (indexed)",
             pattern: "user_[0-9]{4}_event_[A-Z]{3}",
         },
         QueryCase {

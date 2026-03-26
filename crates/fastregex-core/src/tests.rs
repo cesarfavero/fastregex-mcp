@@ -210,3 +210,32 @@ fn explicit_rebuild_foreground_works() {
     let rebuild = engine.index_rebuild(RebuildMode::Foreground).unwrap();
     assert!(rebuild.doc_count >= 1);
 }
+
+#[test]
+fn planner_extracts_required_literals_from_class_patterns() {
+    let tmp = TempDir::new().unwrap();
+    write_file(
+        &tmp.path().join("src/events.txt"),
+        "user_0420_event_ABC\nfoo\n",
+    );
+
+    let engine = build_engine(tmp.path());
+    let response = engine
+        .regex_search("user_[0-9]{4}_event_[A-Z]{3}", SearchOptions::default())
+        .unwrap();
+
+    assert_eq!(response.matches.len(), 1);
+    assert!(!response.used_fallback);
+    assert!(
+        response
+            .extracted_literals
+            .iter()
+            .any(|l| l.contains("user_"))
+    );
+    assert!(
+        response
+            .extracted_literals
+            .iter()
+            .any(|l| l.contains("_event_"))
+    );
+}

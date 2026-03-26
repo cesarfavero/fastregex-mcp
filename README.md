@@ -54,37 +54,64 @@ cargo run -p fastregex-mcp -- --workspace /path/to/repo --index-root /tmp/fastre
 - For indexed paths, no false negatives are expected in final results.
 - If planner extraction is not safe/useful, it falls back to full-candidate scan internally.
 
-## Benchmark (real run, March 26, 2026)
+## Benchmark (real runs, March 26, 2026)
 
 Environment:
 
 - macOS 26.0.1 (build 25A362)
 - Apple M1, 8 GB RAM
-- dataset: synthetic monorepo with 6000 files
-- iterations: 9 per query
+- engine: this repository at the commit recorded in each report header
+
+### Run A: 6000 files, 9 iterations/query
 
 | Query | Pattern | Matches | Candidates (p50) | Candidate reduction | FastRegex p50/p95 (ms) | rg p50/p95 (ms) | Full scan PCRE2 p50/p95 (ms) | FastRegex vs rg (p50) |
 |---|---|---:|---:|---:|---:|---:|---:|---:|
-| Literal token | `needle_alpha_beta` | 858 | 858 | 85.7% | 34.51/39.47 | 73.16/102.40 | 130.11/141.10 | 2.12x |
-| Alternation literal | `alpha_service_endpoint|gamma_worker_token` | 1008 | 966 | 83.9% | 42.85/46.63 | 75.00/87.82 | 138.19/270.26 | 1.75x |
-| Class-heavy (fallback) | `user_[0-9]{4}_event_[A-Z]{3}` | 261 | 6001 | 0.0% | 104.75/107.06 | 53.46/61.38 | 93.34/99.83 | 0.51x |
-| Hex digest (fallback) | `[a-f0-9]{40}` | 353 | 6001 | 0.0% | 287.16/388.80 | 55.87/66.99 | 280.20/285.69 | 0.19x |
+| Literal token | `needle_alpha_beta` | 858 | 858 | 85.7% | 45.83/47.48 | 71.09/75.39 | 126.71/135.25 | 1.55x |
+| Alternation literal | `alpha_service_endpoint|gamma_worker_token` | 1008 | 966 | 83.9% | 54.51/58.74 | 76.21/126.92 | 138.00/155.80 | 1.40x |
+| Class-heavy (indexed) | `user_[0-9]{4}_event_[A-Z]{3}` | 261 | 261 | 95.7% | 13.25/15.74 | 54.47/56.09 | 94.66/101.62 | 4.11x |
+| Hex digest (fallback) | `[a-f0-9]{40}` | 353 | 6001 | 0.0% | 481.38/535.20 | 61.26/65.66 | 280.74/302.14 | 0.13x |
 
-Average speedup vs `rg` (p50 across these 4 queries): **1.14x**.
+Average speedup vs `rg` (p50 across these 4 queries): **1.80x**.
 
-Interpretation:
+### Run B: 24000 files, 3 iterations/query
 
-- Indexed literal-heavy queries are materially faster than `rg` in this run.
-- Fallback-heavy regexes (little/no extractable literals) still work correctly, but currently lose to `rg` in latency.
-- This matches expected behavior for V1 and points to the next optimization targets.
+| Query | Pattern | Matches | Candidates (p50) | Candidate reduction | FastRegex p50/p95 (ms) | rg p50/p95 (ms) | Full scan PCRE2 p50/p95 (ms) | FastRegex vs rg (p50) |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| Literal token | `needle_alpha_beta` | 3429 | 3429 | 85.7% | 248.91/284.44 | 396.55/420.54 | 1062.39/1094.34 | 1.59x |
+| Alternation literal | `alpha_service_endpoint|gamma_worker_token` | 4029 | 3861 | 83.9% | 219.71/220.29 | 334.19/355.09 | 725.14/890.29 | 1.52x |
+| Class-heavy (indexed) | `user_[0-9]{4}_event_[A-Z]{3}` | 1044 | 1044 | 95.7% | 51.67/51.94 | 221.40/280.20 | 420.65/426.24 | 4.29x |
+| Hex digest (fallback) | `[a-f0-9]{40}` | 1412 | 24001 | 0.0% | 1886.22/1968.79 | 239.61/245.39 | 1153.83/1189.36 | 0.13x |
+
+Average speedup vs `rg` (p50 across these 4 queries): **1.88x**.
+
+### Run C: 96000 files, 1 iteration/query
+
+| Query | Pattern | Matches | Candidates (p50) | Candidate reduction | FastRegex p50/p95 (ms) | rg p50/p95 (ms) | Full scan PCRE2 p50/p95 (ms) | FastRegex vs rg (p50) |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| Literal token | `needle_alpha_beta` | 13715 | 13715 | 85.7% | 2618.16/2618.16 | 2487.28/2487.28 | 6587.69/6587.69 | 0.95x |
+| Alternation literal | `alpha_service_endpoint|gamma_worker_token` | 16113 | 15441 | 83.9% | 2631.77/2631.77 | 2117.23/2117.23 | 6616.37/6616.37 | 0.80x |
+| Class-heavy (indexed) | `user_[0-9]{4}_event_[A-Z]{3}` | 4174 | 4174 | 95.7% | 755.60/755.60 | 1739.02/1739.02 | 5911.90/5911.90 | 2.30x |
+| Hex digest (fallback) | `[a-f0-9]{40}` | 5648 | 96001 | 0.0% | 12631.94/12631.94 | 1877.35/1877.35 | 9092.20/9092.20 | 0.15x |
+
+Average speedup vs `rg` (p50 across these 4 queries): **1.05x**.
+Note: Run C is a single-iteration sample and should be treated as directional.
+
+### Reality check on "millions of files in milliseconds"
+
+- With selective patterns (indexed literals), the approach is clearly faster than `rg` in these runs.
+- With low-selectivity patterns like `[a-f0-9]{40}` (no useful literals), V1 correctly falls back to near full-scan behavior and is slower than `rg`.
+- At 96k files, indexed queries are in seconds, not milliseconds. So this V1 is **not** a universal "milliseconds for any regex" claim yet; it is fast when the planner can extract selective constraints and the candidate set is small.
 
 ## Reproduce benchmark
 
 ```bash
-cargo run -p fastregex-bench -- --files 6000 --iterations 9
+cargo run -p fastregex-bench -- --dataset benchmarks/synthetic_6000 --files 6000 --iterations 9
+cargo run -p fastregex-bench -- --dataset benchmarks/synthetic_24000 --files 24000 --iterations 3
+cargo run -p fastregex-bench -- --dataset benchmarks/synthetic_96000 --files 96000 --iterations 1
 ```
 
 Generated outputs:
 
 - report: `benchmarks/latest-results.md`
-- dataset (ignored by git): `benchmarks/synthetic_monorepo`
+- saved snapshots: `benchmarks/results_6000.md`, `benchmarks/results_24000.md`, `benchmarks/results_96000.md`
+- datasets (ignored by git): `benchmarks/synthetic_*`

@@ -1,4 +1,4 @@
 /target
 /.fastregex
-/benchmarks/synthetic_monorepo
+/benchmarks/synthetic_*
 **/.DS_Store

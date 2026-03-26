@@ -523,23 +523,7 @@ impl Engine {
                 })
                 .collect()),
             PlanExpr::And(hashes) => {
-                let mut acc: Option<HashSet<u32>> = None;
-
-                for hash in hashes {
-                    let posting = index.posting_for_hash(*hash)?.unwrap_or_default();
-                    let set: HashSet<u32> = posting.into_iter().collect();
-                    acc = Some(match acc {
-                        None => set,
-                        Some(prev) => prev.intersection(&set).copied().collect(),
-                    });
-
-                    if acc.as_ref().is_some_and(|s| s.is_empty()) {
-                        break;
-                    }
-                }
-
-                let mut filtered: HashSet<u32> = acc
-                    .unwrap_or_default()
+                let mut filtered: HashSet<u32> = Self::intersect_hashes(index, hashes)?
                     .into_iter()
                     .filter(|doc_id| {
                         index
@@ -562,24 +546,7 @@ impl Engine {
                 let mut out = HashSet::<u32>::new();
 
                 for branch in branches {
-                    let mut acc: Option<HashSet<u32>> = None;
-
-                    for hash in branch {
-                        let posting = index.posting_for_hash(*hash)?.unwrap_or_default();
-                        let set: HashSet<u32> = posting.into_iter().collect();
-                        acc = Some(match acc {
-                            None => set,
-                            Some(prev) => prev.intersection(&set).copied().collect(),
-                        });
-
-                        if acc.as_ref().is_some_and(|s| s.is_empty()) {
-                            break;
-                        }
-                    }
-
-                    if let Some(branch_docs) = acc {
-                        out.extend(branch_docs);
-                    }
+                    out.extend(Self::intersect_hashes(index, branch)?);
                 }
 
                 out.retain(|doc_id| {
@@ -599,6 +566,32 @@ impl Engine {
                 Ok(out)
             }
         }
+    }
+
+    fn intersect_hashes(index: &IndexSnapshot, hashes: &[u64]) -> Result<HashSet<u32>> {
+        if hashes.is_empty() {
+            return Ok(HashSet::new());
+        }
+
+        let mut posting_lists = Vec::<Vec<u32>>::with_capacity(hashes.len());
+        for hash in hashes {
+            let posting = index.posting_for_hash(*hash)?.unwrap_or_default();
+            if posting.is_empty() {
+                return Ok(HashSet::new());
+            }
+            posting_lists.push(posting);
+        }
+
+        posting_lists.sort_by_key(|list| list.len());
+        let mut acc = posting_lists[0].clone();
+        for posting in posting_lists.iter().skip(1) {
+            acc = intersect_sorted_doc_ids(&acc, posting);
+            if acc.is_empty() {
+                return Ok(HashSet::new());
+            }
+        }
+
+        Ok(acc.into_iter().collect())
     }
 }
 
@@ -717,6 +710,8 @@ fn scan_candidate(
     deadline: Option<(Instant, u64)>,
     request_id: &Option<String>,
 ) -> Result<()> {
+    let line_starts = build_line_starts(bytes);
+
     for result in regex.find_iter(bytes) {
         check_deadline(deadline, request_id)?;
 
@@ -724,7 +719,7 @@ fn scan_candidate(
         let start = found.start();
         let end = found.end();
 
-        let (line, column, snippet) = line_column_snippet(bytes, start);
+        let (line, column, snippet) = line_column_snippet(bytes, &line_starts, start);
 
         out.push(SearchMatch {
             path: path.to_string(),
@@ -743,30 +738,57 @@ fn scan_candidate(
     Ok(())
 }
 
-fn line_column_snippet(bytes: &[u8], start: usize) -> (usize, usize, String) {
-    let bounded_start = start.min(bytes.len());
+fn build_line_starts(bytes: &[u8]) -> Vec<usize> {
+    let mut starts = Vec::<usize>::new();
+    starts.push(0);
 
-    let mut line = 1usize;
-    for b in &bytes[..bounded_start] {
-        if *b == b'\n' {
-            line += 1;
+    for (idx, b) in bytes.iter().enumerate() {
+        if *b == b'\n' && idx + 1 < bytes.len() {
+            starts.push(idx + 1);
         }
     }
 
-    let line_start = bytes[..bounded_start]
-        .iter()
-        .rposition(|b| *b == b'\n')
-        .map(|idx| idx + 1)
-        .unwrap_or(0);
+    starts
+}
 
-    let line_end = bytes[bounded_start..]
-        .iter()
-        .position(|b| *b == b'\n')
-        .map(|rel| bounded_start + rel)
-        .unwrap_or(bytes.len());
+fn intersect_sorted_doc_ids(left: &[u32], right: &[u32]) -> Vec<u32> {
+    let mut out = Vec::<u32>::with_capacity(left.len().min(right.len()));
+    let mut i = 0usize;
+    let mut j = 0usize;
+
+    while i < left.len() && j < right.len() {
+        match left[i].cmp(&right[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                out.push(left[i]);
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+
+    out
+}
+
+fn line_column_snippet(bytes: &[u8], line_starts: &[usize], start: usize) -> (usize, usize, String) {
+    let bounded_start = start.min(bytes.len());
+    let line_idx = line_starts.partition_point(|&line_start| line_start <= bounded_start);
+    let line_idx = line_idx.saturating_sub(1);
+    let line_start = line_starts.get(line_idx).copied().unwrap_or(0);
+
+    let line_end = if line_idx + 1 < line_starts.len() {
+        line_starts[line_idx + 1].saturating_sub(1)
+    } else {
+        bytes.len()
+    };
 
     let column = bounded_start.saturating_sub(line_start).saturating_add(1);
-    let snippet = String::from_utf8_lossy(&bytes[line_start..line_end]).to_string();
+    let snippet = if line_start <= line_end && line_end <= bytes.len() {
+        String::from_utf8_lossy(&bytes[line_start..line_end]).to_string()
+    } else {
+        String::new()
+    };
 
-    (line, column, snippet)
+    (line_idx + 1, column, snippet)
 }
