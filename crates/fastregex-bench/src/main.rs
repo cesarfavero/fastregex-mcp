@@ -19,6 +19,7 @@ struct Config {
     files: usize,
     iterations: usize,
     prepare_only: bool,
+    no_snippet: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -92,6 +93,7 @@ fn main() -> Result<()> {
             status.indexed_docs,
             case,
             cfg.iterations,
+            cfg.no_snippet,
         )?;
         query_results.push(result);
     }
@@ -110,6 +112,7 @@ fn parse_args() -> Result<Config> {
         files: 6000,
         iterations: 9,
         prepare_only: false,
+        no_snippet: true,
     };
 
     let mut args = env::args().skip(1);
@@ -128,6 +131,7 @@ fn parse_args() -> Result<Config> {
                 cfg.iterations = value.parse().context("--iterations must be an integer")?;
             }
             "--prepare-only" => cfg.prepare_only = true,
+            "--with-snippet" => cfg.no_snippet = false,
             other => return Err(anyhow!("unknown argument: {other}")),
         }
     }
@@ -285,9 +289,11 @@ fn benchmark_case(
     total_docs: usize,
     case: &QueryCase,
     iterations: usize,
+    no_snippet: bool,
 ) -> Result<QueryResult> {
     let mut options = SearchOptions::default();
     options.max_results = 250_000;
+    options.no_snippet = no_snippet;
 
     // Warm-up.
     let warm = engine.regex_search(case.pattern, options.clone())?;
@@ -481,6 +487,7 @@ fn render_markdown_report(cfg: &Config, commit: &str, results: &[QueryResult]) -
     lines.push(format!("- Dataset: `{}`", cfg.dataset_root.display()));
     lines.push(format!("- Generated files: {}", cfg.files));
     lines.push(format!("- Iterations per query: {}", cfg.iterations));
+    lines.push(format!("- no_snippet: {}", cfg.no_snippet));
     lines.push(format!("- Base commit id: `{commit}`"));
     lines.push(String::new());
 

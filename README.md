@@ -96,6 +96,11 @@ Average speedup vs `rg` (p50 across these 4 queries): **1.88x**.
 Average speedup vs `rg` (p50 across these 4 queries): **1.05x**.
 Note: Run C is a single-iteration sample and should be treated as directional.
 
+### Quick tuning run (3000 files, no_snippet=true)
+
+- Average speedup vs `rg`: **2.00x**
+- Full report: `benchmarks/results_3000.md`
+
 ### Reality check on "millions of files in milliseconds"
 
 - With selective patterns (indexed literals), the approach is clearly faster than `rg` in these runs.

@@ -68,10 +68,12 @@ pub fn build_query_plan(
                 continue;
             }
 
-            let grams =
-                build_covering_sparse_ngrams(literal.as_bytes(), bigram_frequency, sparse_cfg);
+            let grams = build_covering_sparse_ngrams(literal.as_bytes(), bigram_frequency, sparse_cfg);
             for gram in grams {
                 dedup.insert(hash_gram(&gram));
+            }
+            if dedup.len() < MIN_QUERY_GRAMS {
+                add_literal_trigrams(literal.as_bytes(), &mut dedup, MAX_TRIGRAM_ADDS);
             }
             branch_literals.push(literal);
         }
@@ -98,6 +100,9 @@ pub fn build_query_plan(
         used_fallback: false,
     }
 }
+
+const MIN_QUERY_GRAMS: usize = 2;
+const MAX_TRIGRAM_ADDS: usize = 8;
 
 #[derive(Debug, Clone)]
 struct BranchLiteralAnalysis {
@@ -187,6 +192,22 @@ fn analyze_branch_required_literals(branch: &str) -> BranchLiteralAnalysis {
     BranchLiteralAnalysis {
         required_literals: literals,
         parse_ok,
+    }
+}
+
+fn add_literal_trigrams(literal: &[u8], dedup: &mut HashSet<u64>, limit: usize) {
+    if literal.len() < 3 || limit == 0 {
+        return;
+    }
+
+    let mut added = 0usize;
+    for tri in literal.windows(3) {
+        if dedup.insert(hash_gram(tri)) {
+            added += 1;
+            if added >= limit {
+                break;
+            }
+        }
     }
 }
 

@@ -35,6 +35,8 @@ pub struct SearchOptions {
     pub dotall: bool,
     #[serde(default)]
     pub multiline: bool,
+    #[serde(default)]
+    pub no_snippet: bool,
     pub timeout_ms: Option<u64>,
     pub request_id: Option<String>,
 }
@@ -49,6 +51,7 @@ impl Default for SearchOptions {
             case_sensitive: default_case_sensitive(),
             dotall: false,
             multiline: false,
+            no_snippet: false,
             timeout_ms: None,
             request_id: None,
         }
@@ -289,6 +292,7 @@ impl Engine {
                 max_results,
                 deadline,
                 &options.request_id,
+                !options.no_snippet,
             )?;
 
             if out.len() >= max_results {
@@ -313,6 +317,7 @@ impl Engine {
                         max_results,
                         deadline,
                         &options.request_id,
+                        !options.no_snippet,
                     )?;
                 }
 
@@ -709,6 +714,7 @@ fn scan_candidate(
     max_results: usize,
     deadline: Option<(Instant, u64)>,
     request_id: &Option<String>,
+    include_snippet: bool,
 ) -> Result<()> {
     let line_starts = build_line_starts(bytes);
 
@@ -719,7 +725,12 @@ fn scan_candidate(
         let start = found.start();
         let end = found.end();
 
-        let (line, column, snippet) = line_column_snippet(bytes, &line_starts, start);
+        let (line, column, snippet) = if include_snippet {
+            line_column_snippet(bytes, &line_starts, start)
+        } else {
+            let (line, column) = line_column_only(&line_starts, start);
+            (line, column, String::new())
+        };
 
         out.push(SearchMatch {
             path: path.to_string(),
@@ -769,6 +780,14 @@ fn intersect_sorted_doc_ids(left: &[u32], right: &[u32]) -> Vec<u32> {
     }
 
     out
+}
+
+fn line_column_only(line_starts: &[usize], start: usize) -> (usize, usize) {
+    let line_idx = line_starts.partition_point(|&line_start| line_start <= start);
+    let line_idx = line_idx.saturating_sub(1);
+    let line_start = line_starts.get(line_idx).copied().unwrap_or(0);
+    let column = start.saturating_sub(line_start).saturating_add(1);
+    (line_idx + 1, column)
 }
 
 fn line_column_snippet(bytes: &[u8], line_starts: &[usize], start: usize) -> (usize, usize, String) {
