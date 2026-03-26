@@ -169,3 +169,4 @@ Example (video-generate):
 
 - Report: `benchmarks/results_real_video_generate.md`
 - Average speedup vs `rg`: **19.02x** (3 patterns, no_snippet=true)
+- TODO pattern speedup: **32.61x** (best-case literal)
