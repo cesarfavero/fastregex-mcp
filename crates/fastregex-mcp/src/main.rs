@@ -24,13 +24,21 @@ fn main() -> Result<()> {
         .with_writer(io::stderr)
         .init();
 
-    let (workspace, index_root) = parse_args()?;
+    let (workspace, index_root, auto_index) = parse_args()?;
     let mut config = EngineConfig::for_workspace(&workspace);
     if let Some(index_root) = index_root {
         config.index_root = index_root;
     }
 
     let engine = Engine::new(config).context("failed to initialize fastregex engine")?;
+
+    if auto_index {
+        if let Ok(status) = engine.index_status() {
+            if status.freshness != "fresh" {
+                let _ = engine.index_rebuild(RebuildMode::Background);
+            }
+        }
+    }
 
     let stdin = io::stdin();
     let stdout = io::stdout();
@@ -69,9 +77,10 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn parse_args() -> Result<(PathBuf, Option<PathBuf>)> {
+fn parse_args() -> Result<(PathBuf, Option<PathBuf>, bool)> {
     let mut workspace = env::current_dir().context("failed to get current directory")?;
     let mut index_root = None;
+    let mut auto_index = true;
 
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -84,11 +93,23 @@ fn parse_args() -> Result<(PathBuf, Option<PathBuf>)> {
                 let value = args.next().context("missing value for --index-root")?;
                 index_root = Some(PathBuf::from(value));
             }
+            "--auto-index" => auto_index = true,
+            "--no-auto-index" => auto_index = false,
             _ => return Err(anyhow!("unknown argument: {arg}")),
         }
     }
 
-    Ok((workspace, index_root))
+    if let Ok(env_value) = env::var("FASTREGEX_AUTO_INDEX") {
+        let normalized = env_value.trim().to_ascii_lowercase();
+        if matches!(normalized.as_str(), "0" | "false" | "no") {
+            auto_index = false;
+        }
+        if matches!(normalized.as_str(), "1" | "true" | "yes") {
+            auto_index = true;
+        }
+    }
+
+    Ok((workspace, index_root, auto_index))
 }
 
 fn handle_notification(engine: &Engine, request: &RpcRequest) -> Result<()> {

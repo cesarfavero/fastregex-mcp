@@ -40,6 +40,11 @@ Optional custom index path:
 cargo run -p fastregex-mcp -- --workspace /path/to/repo --index-root /tmp/fastregex-index
 ```
 
+Auto-indexing on startup (default):
+
+- On startup, the MCP checks index freshness and triggers a background rebuild if stale.
+- Disable with `--no-auto-index` or `FASTREGEX_AUTO_INDEX=0`.
+
 ## MCP API
 
 - `regex_search(pattern, options)`
