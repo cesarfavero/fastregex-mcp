@@ -45,6 +45,39 @@ Auto-indexing on startup (default):
 - On startup, the MCP checks index freshness and triggers a background rebuild if stale.
 - Disable with `--no-auto-index` or `FASTREGEX_AUTO_INDEX=0`.
 
+## Install / Use on a repo (local)
+
+What happens:
+
+- The MCP is installed and run locally by the user (desktop or VPS).
+- It indexes the repo pointed by `--workspace`.
+- The client/IA calls `regex_search` and gets responses immediately from the index.
+
+Quick start (from this repo):
+
+```bash
+# 1) Clone fastregex-mcp
+git clone https://github.com/cesarfavero/fastregex-mcp.git
+cd fastregex-mcp
+
+# 2) Run MCP pointing to a target repo
+cargo run -p fastregex-mcp -- --workspace /path/to/your-repo
+```
+
+If you want to install it inside the target repo folder:
+
+```bash
+cd /path/to/your-repo
+git clone https://github.com/cesarfavero/fastregex-mcp.git .fastregex-mcp
+cd .fastregex-mcp
+cargo run -p fastregex-mcp -- --workspace /path/to/your-repo
+```
+
+Notes:
+
+- This does not upload code anywhere. Indexing is local.
+- `regex_search` handles literal phrases automatically and is fast by default.
+
 ## MCP API
 
 - `regex_search(pattern, options)`
