@@ -90,6 +90,14 @@ Use this checklist when an AI agent is asked to install FastRegex for a repo:
 Skill file (for Smithery or similar tools):
 
 - `wrappers/skills/fastregex-install/SKILL.md`
+- `wrappers/skills/fastregex-policy/SKILL.md`
+
+Smithery example:
+
+```bash
+npx @smithery/cli@latest skill add fastregex-install - < wrappers/skills/fastregex-install/SKILL.md
+npx @smithery/cli@latest skill add fastregex-policy - < wrappers/skills/fastregex-policy/SKILL.md
+```
 
 ## MCP API
 
