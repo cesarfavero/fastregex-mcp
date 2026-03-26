@@ -1,0 +1,4 @@
+/target
+/.fastregex
+/benchmarks/synthetic_monorepo
+**/.DS_Store
