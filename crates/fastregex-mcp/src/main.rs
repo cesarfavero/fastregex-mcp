@@ -33,11 +33,30 @@ fn main() -> Result<()> {
     let engine = Engine::new(config).context("failed to initialize fastregex engine")?;
 
     if auto_index {
-        if let Ok(status) = engine.index_status() {
-            if status.freshness != "fresh" {
-                let _ = engine.index_rebuild(RebuildMode::Background);
+        match engine.index_status() {
+            Ok(status) => {
+                if status.freshness == "fresh" {
+                    tracing::info!(
+                        base_commit = %status.base_commit,
+                        overlay_dirty_files = status.overlay_dirty_files,
+                        "fastregex index ready"
+                    );
+                } else {
+                    tracing::info!(
+                        base_commit = %status.base_commit,
+                        current_commit = %status.current_commit,
+                        overlay_dirty_files = status.overlay_dirty_files,
+                        "fastregex index stale, starting background rebuild"
+                    );
+                    let _ = engine.index_rebuild(RebuildMode::Background);
+                }
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "fastregex index status failed, skipping auto-index");
             }
         }
+    } else {
+        tracing::info!("fastregex auto-index disabled");
     }
 
     let stdin = io::stdin();
