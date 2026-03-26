@@ -20,12 +20,14 @@ struct Config {
     iterations: usize,
     prepare_only: bool,
     no_snippet: bool,
+    real_repo: Option<PathBuf>,
+    patterns: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
 struct QueryCase {
-    name: &'static str,
-    pattern: &'static str,
+    name: String,
+    pattern: String,
 }
 
 #[derive(Debug, Clone)]
@@ -46,49 +48,65 @@ struct QueryResult {
 fn main() -> Result<()> {
     let cfg = parse_args()?;
 
-    ensure_synthetic_dataset(&cfg.dataset_root, cfg.files)?;
-    if cfg.prepare_only {
-        println!(
-            "dataset prepared at {} with {} files",
-            cfg.dataset_root.display(),
-            cfg.files
-        );
-        return Ok(());
+    if cfg.real_repo.is_none() {
+        ensure_synthetic_dataset(&cfg.dataset_root, cfg.files)?;
+        if cfg.prepare_only {
+            println!(
+                "dataset prepared at {} with {} files",
+                cfg.dataset_root.display(),
+                cfg.files
+            );
+            return Ok(());
+        }
     }
 
-    let mut engine_cfg = EngineConfig::for_workspace(&cfg.dataset_root);
+    let workspace_root = cfg
+        .real_repo
+        .clone()
+        .unwrap_or_else(|| cfg.dataset_root.clone());
+    let mut engine_cfg = EngineConfig::for_workspace(&workspace_root);
     engine_cfg.build.max_file_bytes = 8 * 1024 * 1024;
 
     let engine = Engine::new(engine_cfg)?;
     let status = engine.index_status()?;
 
-    let cases = vec![
-        QueryCase {
-            name: "Literal token",
-            pattern: "needle_alpha_beta",
-        },
-        QueryCase {
-            name: "Alternation literal",
-            pattern: "alpha_service_endpoint|gamma_worker_token",
-        },
-        QueryCase {
-            name: "Class-heavy (indexed)",
-            pattern: "user_[0-9]{4}_event_[A-Z]{3}",
-        },
-        QueryCase {
-            name: "Hex digest (fallback)",
-            pattern: "[a-f0-9]{40}",
-        },
-    ];
+    let cases = if cfg.patterns.is_empty() {
+        vec![
+            QueryCase {
+                name: "Literal token".to_string(),
+                pattern: "needle_alpha_beta".to_string(),
+            },
+            QueryCase {
+                name: "Alternation literal".to_string(),
+                pattern: "alpha_service_endpoint|gamma_worker_token".to_string(),
+            },
+            QueryCase {
+                name: "Class-heavy (indexed)".to_string(),
+                pattern: "user_[0-9]{4}_event_[A-Z]{3}".to_string(),
+            },
+            QueryCase {
+                name: "Hex digest (fallback)".to_string(),
+                pattern: "[a-f0-9]{40}".to_string(),
+            },
+        ]
+    } else {
+        cfg.patterns
+            .iter()
+            .map(|pattern| QueryCase {
+                name: pattern.clone(),
+                pattern: pattern.clone(),
+            })
+            .collect()
+    };
 
-    let file_list = collect_text_files(&cfg.dataset_root)?;
+    let file_list = collect_text_files(&workspace_root)?;
 
     let mut query_results = Vec::new();
 
     for case in &cases {
         let result = benchmark_case(
             &engine,
-            &cfg.dataset_root,
+            &workspace_root,
             &file_list,
             status.indexed_docs,
             case,
@@ -98,7 +116,13 @@ fn main() -> Result<()> {
         query_results.push(result);
     }
 
-    let report = render_markdown_report(&cfg, &status.base_commit, &query_results);
+    let report = render_markdown_report(
+        &cfg,
+        &workspace_root,
+        &status.base_commit,
+        status.indexed_docs,
+        &query_results,
+    );
     fs::create_dir_all("benchmarks")?;
     fs::write("benchmarks/latest-results.md", &report)?;
 
@@ -113,6 +137,8 @@ fn parse_args() -> Result<Config> {
         iterations: 9,
         prepare_only: false,
         no_snippet: true,
+        real_repo: None,
+        patterns: Vec::new(),
     };
 
     let mut args = env::args().skip(1);
@@ -132,6 +158,14 @@ fn parse_args() -> Result<Config> {
             }
             "--prepare-only" => cfg.prepare_only = true,
             "--with-snippet" => cfg.no_snippet = false,
+            "--real" => {
+                let value = args.next().context("missing value for --real")?;
+                cfg.real_repo = Some(PathBuf::from(value));
+            }
+            "--pattern" => {
+                let value = args.next().context("missing value for --pattern")?;
+                cfg.patterns.push(value);
+            }
             other => return Err(anyhow!("unknown argument: {other}")),
         }
     }
@@ -296,11 +330,11 @@ fn benchmark_case(
     options.no_snippet = no_snippet;
 
     // Warm-up.
-    let warm = engine.regex_search(case.pattern, options.clone())?;
+    let warm = engine.regex_search(case.pattern.as_str(), options.clone())?;
     let expected_matches = warm.matches.len();
 
-    let _ = run_ripgrep(dataset_root, case.pattern)?;
-    let _ = run_full_scan(files, case.pattern)?;
+    let _ = run_ripgrep(dataset_root, case.pattern.as_str())?;
+    let _ = run_full_scan(files, case.pattern.as_str())?;
 
     let mut fast_times = Vec::<f64>::new();
     let mut rg_times = Vec::<f64>::new();
@@ -309,7 +343,7 @@ fn benchmark_case(
 
     for _ in 0..iterations {
         let t0 = Instant::now();
-        let fast = engine.regex_search(case.pattern, options.clone())?;
+        let fast = engine.regex_search(case.pattern.as_str(), options.clone())?;
         fast_times.push(elapsed_ms(t0.elapsed()));
         candidate_counts.push(fast.candidate_count);
 
@@ -321,7 +355,7 @@ fn benchmark_case(
         }
 
         let t1 = Instant::now();
-        let rg_count = run_ripgrep(dataset_root, case.pattern)?;
+        let rg_count = run_ripgrep(dataset_root, case.pattern.as_str())?;
         rg_times.push(elapsed_ms(t1.elapsed()));
 
         if rg_count != expected_matches {
@@ -334,7 +368,7 @@ fn benchmark_case(
         }
 
         let t2 = Instant::now();
-        let full_count = run_full_scan(files, case.pattern)?;
+        let full_count = run_full_scan(files, case.pattern.as_str())?;
         full_times.push(elapsed_ms(t2.elapsed()));
 
         if full_count != expected_matches {
@@ -395,6 +429,14 @@ fn run_ripgrep(root: &Path, pattern: &str) -> Result<usize> {
         .arg("--color")
         .arg("never")
         .arg("--hidden")
+        .arg("--glob")
+        .arg("!**/.git/**")
+        .arg("--glob")
+        .arg("!**/.fastregex/**")
+        .arg("--glob")
+        .arg("!**/node_modules/**")
+        .arg("--glob")
+        .arg("!**/target/**")
         .arg(pattern)
         .arg(root)
         .output()
@@ -479,13 +521,23 @@ fn percentile_usize(mut values: Vec<usize>, p: f64) -> usize {
     values[rank.min(values.len() - 1)]
 }
 
-fn render_markdown_report(cfg: &Config, commit: &str, results: &[QueryResult]) -> String {
+fn render_markdown_report(
+    cfg: &Config,
+    workspace_root: &Path,
+    commit: &str,
+    indexed_docs: usize,
+    results: &[QueryResult],
+) -> String {
     let mut lines = Vec::<String>::new();
 
     lines.push("# FastRegex Benchmark Results".to_string());
     lines.push(String::new());
-    lines.push(format!("- Dataset: `{}`", cfg.dataset_root.display()));
-    lines.push(format!("- Generated files: {}", cfg.files));
+    lines.push(format!("- Dataset: `{}`", workspace_root.display()));
+    if cfg.real_repo.is_some() {
+        lines.push(format!("- Indexed docs: {}", indexed_docs));
+    } else {
+        lines.push(format!("- Generated files: {}", cfg.files));
+    }
     lines.push(format!("- Iterations per query: {}", cfg.iterations));
     lines.push(format!("- no_snippet: {}", cfg.no_snippet));
     lines.push(format!("- Base commit id: `{commit}`"));

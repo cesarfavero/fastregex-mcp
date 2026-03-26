@@ -125,3 +125,14 @@ Generated outputs:
 - report: `benchmarks/latest-results.md`
 - saved snapshots: `benchmarks/results_6000.md`, `benchmarks/results_24000.md`, `benchmarks/results_96000.md`
 - datasets (ignored by git): `benchmarks/synthetic_*`
+
+Real repo benchmark:
+
+```bash
+cargo run -p fastregex-bench -- --real /path/to/repo --iterations 3 --pattern "function|class" --pattern "TODO"
+```
+
+Example (video-generate):
+
+- Report: `benchmarks/results_real_video_generate.md`
+- Average speedup vs `rg`: **19.02x** (3 patterns, no_snippet=true)
