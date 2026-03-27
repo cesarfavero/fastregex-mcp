@@ -73,7 +73,12 @@ pub fn build_query_plan(
                 dedup.insert(hash_gram(&gram));
             }
             if dedup.len() < MIN_QUERY_GRAMS {
-                add_literal_trigrams(literal.as_bytes(), &mut dedup, MAX_TRIGRAM_ADDS);
+                let limit = if literal.len() >= 12 {
+                    MAX_TRIGRAM_ADDS
+                } else {
+                    MAX_TRIGRAM_ADDS / 2
+                };
+                add_literal_trigrams(literal.as_bytes(), &mut dedup, limit);
             }
             branch_literals.push(literal);
         }
@@ -101,8 +106,8 @@ pub fn build_query_plan(
     }
 }
 
-const MIN_QUERY_GRAMS: usize = 2;
-const MAX_TRIGRAM_ADDS: usize = 8;
+const MIN_QUERY_GRAMS: usize = 3;
+const MAX_TRIGRAM_ADDS: usize = 16;
 
 #[derive(Debug, Clone)]
 struct BranchLiteralAnalysis {

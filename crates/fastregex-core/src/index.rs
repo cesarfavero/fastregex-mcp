@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -6,6 +6,7 @@ use std::process::Command;
 use std::time::UNIX_EPOCH;
 
 use memmap2::MmapOptions;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
@@ -75,6 +76,7 @@ pub struct IndexSnapshot {
     postings_mmap: memmap2::Mmap,
     lookup_entry_count: usize,
     path_to_doc: HashMap<String, u32>,
+    posting_cache: Mutex<PostingCache>,
 }
 
 impl IndexSnapshot {
@@ -127,6 +129,7 @@ impl IndexSnapshot {
             postings_mmap,
             lookup_entry_count: lookup_header.entry_count as usize,
             path_to_doc,
+            posting_cache: Mutex::new(PostingCache::new(4096)),
         })
     }
 
@@ -147,6 +150,10 @@ impl IndexSnapshot {
     }
 
     pub fn posting_for_hash(&self, hash: u64) -> Result<Option<Vec<u32>>> {
+        if let Some(cached) = self.posting_cache.lock().get(hash) {
+            return Ok(Some(cached));
+        }
+
         let mut low = 0usize;
         let mut high = self.lookup_entry_count;
 
@@ -156,6 +163,7 @@ impl IndexSnapshot {
 
             if mid_hash == hash {
                 let docs = self.decode_posting(offset as usize)?;
+                self.posting_cache.lock().insert(hash, docs.clone());
                 return Ok(Some(docs));
             }
 
@@ -368,6 +376,53 @@ struct PostingsHeader {
 struct LookupHeader {
     checksum: u64,
     entry_count: u32,
+}
+
+#[derive(Debug)]
+struct PostingCache {
+    cap: usize,
+    order: VecDeque<u64>,
+    map: HashMap<u64, Vec<u32>>,
+}
+
+impl PostingCache {
+    fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            order: VecDeque::new(),
+            map: HashMap::new(),
+        }
+    }
+
+    fn get(&mut self, hash: u64) -> Option<Vec<u32>> {
+        let value = self.map.get(&hash).cloned()?;
+        self.bump(hash);
+        Some(value)
+    }
+
+    fn insert(&mut self, hash: u64, docs: Vec<u32>) {
+        if self.map.contains_key(&hash) {
+            self.map.insert(hash, docs);
+            self.bump(hash);
+            return;
+        }
+
+        if self.map.len() >= self.cap {
+            if let Some(old) = self.order.pop_front() {
+                self.map.remove(&old);
+            }
+        }
+
+        self.map.insert(hash, docs);
+        self.order.push_back(hash);
+    }
+
+    fn bump(&mut self, hash: u64) {
+        if let Some(pos) = self.order.iter().position(|h| *h == hash) {
+            self.order.remove(pos);
+            self.order.push_back(hash);
+        }
+    }
 }
 
 fn should_skip(path: &Path) -> bool {
