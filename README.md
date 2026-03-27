@@ -193,3 +193,8 @@ Example (video-generate):
 - Report: `benchmarks/results_real_video_generate.md`
 - Average speedup vs `rg`: **19.02x** (3 patterns, no_snippet=true)
 - TODO pattern speedup: **32.61x** (best-case literal)
+
+Example (openclaw):
+
+- Report: `benchmarks/results_real_openclaw.md`
+- Average speedup vs `rg`: **1.74x** (3 patterns, no_snippet=true, 10.5k indexed docs)

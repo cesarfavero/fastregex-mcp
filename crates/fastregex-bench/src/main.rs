@@ -329,12 +329,19 @@ fn benchmark_case(
     options.max_results = 250_000;
     options.no_snippet = no_snippet;
 
-    // Warm-up.
+    // Warm-up + establish expected match count from full scan.
     let warm = engine.regex_search(case.pattern.as_str(), options.clone())?;
-    let expected_matches = warm.matches.len();
+    let expected_matches = run_full_scan(files, case.pattern.as_str())?;
+    if warm.matches.len() != expected_matches {
+        return Err(anyhow!(
+            "fastregex count mismatch for pattern '{}': expected {}, got {}",
+            case.pattern,
+            expected_matches,
+            warm.matches.len()
+        ));
+    }
 
     let _ = run_ripgrep(dataset_root, case.pattern.as_str())?;
-    let _ = run_full_scan(files, case.pattern.as_str())?;
 
     let mut fast_times = Vec::<f64>::new();
     let mut rg_times = Vec::<f64>::new();
@@ -357,14 +364,11 @@ fn benchmark_case(
         let t1 = Instant::now();
         let rg_count = run_ripgrep(dataset_root, case.pattern.as_str())?;
         rg_times.push(elapsed_ms(t1.elapsed()));
-
         if rg_count != expected_matches {
-            return Err(anyhow!(
-                "ripgrep count mismatch for pattern '{}': expected {}, got {}",
-                case.pattern,
-                expected_matches,
-                rg_count
-            ));
+            eprintln!(
+                "warning: ripgrep count mismatch for pattern '{}': expected {}, got {}",
+                case.pattern, expected_matches, rg_count
+            );
         }
 
         let t2 = Instant::now();

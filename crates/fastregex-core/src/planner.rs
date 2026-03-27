@@ -70,7 +70,9 @@ pub fn build_query_plan(
 
             let grams = build_covering_sparse_ngrams(literal.as_bytes(), bigram_frequency, sparse_cfg);
             for gram in grams {
-                dedup.insert(hash_gram(&gram));
+                if gram.len() == 3 {
+                    dedup.insert(hash_gram(&gram));
+                }
             }
             if dedup.len() < MIN_QUERY_GRAMS {
                 let limit = if literal.len() >= 12 {
