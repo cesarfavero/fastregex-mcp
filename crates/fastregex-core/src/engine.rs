@@ -43,6 +43,49 @@ pub struct SearchOptions {
     pub request_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HashLogic {
+    And,
+    Or,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HashSearchOptions {
+    #[serde(default)]
+    pub include: Vec<String>,
+    #[serde(default)]
+    pub exclude: Vec<String>,
+    #[serde(default)]
+    pub globs: Vec<String>,
+    #[serde(default = "default_max_results")]
+    pub max_results: usize,
+    #[serde(default = "default_case_sensitive")]
+    pub case_sensitive: bool,
+    #[serde(default)]
+    pub no_snippet: bool,
+    #[serde(default)]
+    pub verify_literal: Option<String>,
+    pub timeout_ms: Option<u64>,
+    pub request_id: Option<String>,
+}
+
+impl Default for HashSearchOptions {
+    fn default() -> Self {
+        Self {
+            include: Vec::new(),
+            exclude: Vec::new(),
+            globs: Vec::new(),
+            max_results: default_max_results(),
+            case_sensitive: default_case_sensitive(),
+            no_snippet: false,
+            verify_literal: None,
+            timeout_ms: None,
+            request_id: None,
+        }
+    }
+}
+
 impl Default for SearchOptions {
     fn default() -> Self {
         Self {
@@ -369,6 +412,133 @@ impl Engine {
         })
     }
 
+    pub fn hash_search(
+        &self,
+        hashes: &[u64],
+        logic: HashLogic,
+        options: HashSearchOptions,
+    ) -> Result<SearchResponse> {
+        let max_results = if options.max_results == 0 {
+            default_max_results()
+        } else {
+            options.max_results
+        };
+
+        let deadline = options
+            .timeout_ms
+            .map(|ms| (Instant::now() + Duration::from_millis(ms), ms));
+
+        let (index, base_generation) = {
+            let base = self.inner.base.read();
+            (Arc::clone(&base.snapshot), base.generation)
+        };
+
+        let filter = PathFilter::new(&options.include, &options.globs, &options.exclude)?;
+
+        let mut base_candidates = self.base_candidates_hash(&index, hashes, logic, &filter)?;
+        let overlay_snapshot = self.inner.overlay.snapshot();
+        let overlay_generation = overlay_snapshot.generation;
+
+        let mut overlay_candidates = Vec::<String>::new();
+        for (path, entry) in &overlay_snapshot.files {
+            if let Some(doc_id) = index.doc_id_for_path(path) {
+                base_candidates.remove(&doc_id);
+            }
+
+            if !filter.allows(path) {
+                continue;
+            }
+
+            match entry {
+                OverlayEntry::Deleted => {}
+                OverlayEntry::Modified(file) => {
+                    if overlay_hash_match(&file.gram_hashes, hashes, logic) {
+                        overlay_candidates.push(path.clone());
+                    }
+                }
+            }
+        }
+
+        let mut base_ids: Vec<u32> = base_candidates.into_iter().collect();
+        base_ids.sort_unstable();
+        overlay_candidates.sort();
+        overlay_candidates.dedup();
+
+        let candidate_count = base_ids.len() + overlay_candidates.len();
+
+        let mut out = Vec::<SearchMatch>::new();
+        let mut regex = None;
+        if let Some(literal) = options.verify_literal.as_deref() {
+            let mut builder = RegexBuilder::new();
+            builder.caseless(!options.case_sensitive);
+            let escaped = escape_literal_for_pcre2(literal);
+            regex = Some(
+                builder
+                    .build(&escaped)
+                    .map_err(|err| FastRegexError::RegexCompile(err.to_string()))?,
+            );
+        }
+
+        for doc_id in base_ids {
+            check_deadline(deadline, &options.request_id)?;
+            let Some(doc) = index.doc_by_id(doc_id) else {
+                continue;
+            };
+            let Some(bytes) = read_bytes(&self.inner.config.workspace_root.join(&doc.path))? else {
+                continue;
+            };
+
+            if let Some(re) = regex.as_ref() {
+                scan_candidate(
+                    re,
+                    &doc.path,
+                    &bytes,
+                    &mut out,
+                    max_results,
+                    deadline,
+                    &options.request_id,
+                    !options.no_snippet,
+                )?;
+                if out.len() >= max_results {
+                    break;
+                }
+            }
+        }
+
+        if out.len() < max_results {
+            for path in overlay_candidates {
+                check_deadline(deadline, &options.request_id)?;
+                let Some(entry) = overlay_snapshot.files.get(&path) else {
+                    continue;
+                };
+                if let (Some(re), OverlayEntry::Modified(file)) = (regex.as_ref(), entry) {
+                    scan_candidate(
+                        re,
+                        &path,
+                        file.text.as_bytes(),
+                        &mut out,
+                        max_results,
+                        deadline,
+                        &options.request_id,
+                        !options.no_snippet,
+                    )?;
+                }
+                if out.len() >= max_results {
+                    break;
+                }
+            }
+        }
+
+        Ok(SearchResponse {
+            matches: out,
+            candidate_count,
+            used_fallback: false,
+            extracted_literals: Vec::new(),
+            base_generation,
+            overlay_generation,
+        })
+    }
+
     pub fn index_update_files(&self, changed_files: &[String]) -> Result<OverlayUpdateResult> {
         let base = self.inner.base.read();
         let bigram_frequency = base.snapshot.bigram_frequency.clone();
@@ -546,6 +716,18 @@ impl Engine {
                     })
                     .collect();
 
+                if filtered.is_empty() {
+                    return Ok(index
+                        .all_doc_ids()
+                        .filter(|doc_id| {
+                            index
+                                .doc_by_id(*doc_id)
+                                .map(|doc| filter.allows(&doc.path))
+                                .unwrap_or(false)
+                        })
+                        .collect());
+                }
+
                 filtered.extend(index.unindexed_doc_ids().filter(|doc_id| {
                     index
                         .doc_by_id(*doc_id)
@@ -560,6 +742,18 @@ impl Engine {
 
                 for branch in branches {
                     out.extend(Self::intersect_hashes(index, branch)?);
+                }
+
+                if out.is_empty() {
+                    return Ok(index
+                        .all_doc_ids()
+                        .filter(|doc_id| {
+                            index
+                                .doc_by_id(*doc_id)
+                                .map(|doc| filter.allows(&doc.path))
+                                .unwrap_or(false)
+                        })
+                        .collect());
                 }
 
                 out.retain(|doc_id| {
@@ -605,6 +799,49 @@ impl Engine {
         }
 
         Ok(acc.into_iter().collect())
+    }
+
+    fn base_candidates_hash(
+        &self,
+        index: &IndexSnapshot,
+        hashes: &[u64],
+        logic: HashLogic,
+        filter: &PathFilter,
+    ) -> Result<HashSet<u32>> {
+        let mut out = match logic {
+            HashLogic::And => {
+                if hashes.is_empty() {
+                    index.all_doc_ids().collect()
+                } else {
+                    Self::intersect_hashes(index, hashes)?
+                }
+            }
+            HashLogic::Or => {
+                let mut set = HashSet::<u32>::new();
+                for hash in hashes {
+                    if let Some(posting) = index.posting_for_hash(*hash)? {
+                        set.extend(posting);
+                    }
+                }
+                set
+            }
+        };
+
+        out.retain(|doc_id| {
+            index
+                .doc_by_id(*doc_id)
+                .map(|doc| filter.allows(&doc.path))
+                .unwrap_or(false)
+        });
+
+        out.extend(index.unindexed_doc_ids().filter(|doc_id| {
+            index
+                .doc_by_id(*doc_id)
+                .map(|doc| filter.allows(&doc.path))
+                .unwrap_or(false)
+        }));
+
+        Ok(out)
     }
 }
 
@@ -802,6 +1039,13 @@ fn intersect_sorted_doc_ids(left: &[u32], right: &[u32]) -> Vec<u32> {
     }
 
     out
+}
+
+fn overlay_hash_match(file_hashes: &HashSet<u64>, hashes: &[u64], logic: HashLogic) -> bool {
+    match logic {
+        HashLogic::And => hashes.iter().all(|h| file_hashes.contains(h)),
+        HashLogic::Or => hashes.iter().any(|h| file_hashes.contains(h)),
+    }
 }
 
 fn line_column_only(line_starts: &[usize], start: usize) -> (usize, usize) {

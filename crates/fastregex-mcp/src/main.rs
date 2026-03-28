@@ -3,7 +3,7 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow};
-use fastregex_core::{Engine, EngineConfig, RebuildMode, SearchOptions};
+use fastregex_core::{Engine, EngineConfig, HashLogic, HashSearchOptions, RebuildMode, SearchOptions};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -198,6 +198,10 @@ fn handle_request(engine: &Engine, request: RpcRequest) -> Result<Value> {
             let args = request.params.unwrap_or_else(|| json!({}));
             dispatch_tool(engine, "regex_search", args)
         }
+        "hash_search" => {
+            let args = request.params.unwrap_or_else(|| json!({}));
+            dispatch_tool(engine, "hash_search", args)
+        }
         "index_status" => dispatch_tool(engine, "index_status", json!({})),
         "index_update_files" => {
             let args = request.params.unwrap_or_else(|| json!({}));
@@ -258,6 +262,34 @@ fn dispatch_tool(engine: &Engine, name: &str, args: Value) -> Result<Value> {
 
             let options = parse_search_options(&args)?;
             let result = engine.regex_search(pattern, options)?;
+            Ok(serde_json::to_value(result)?)
+        }
+        "hash_search" => {
+            let hashes = args
+                .get("hashes")
+                .and_then(Value::as_array)
+                .ok_or_else(|| anyhow!("hash_search requires 'hashes' array"))?;
+            let hashes = hashes
+                .iter()
+                .map(|v| {
+                    v.as_u64()
+                        .map(|h| h as u64)
+                        .ok_or_else(|| anyhow!("hashes must contain u64 values"))
+                })
+                .collect::<Result<Vec<u64>>>()?;
+
+            let logic = args
+                .get("logic")
+                .and_then(Value::as_str)
+                .unwrap_or("and");
+            let logic = match logic {
+                "and" => HashLogic::And,
+                "or" => HashLogic::Or,
+                other => return Err(anyhow!("invalid logic '{other}'")),
+            };
+
+            let options = parse_hash_options(&args)?;
+            let result = engine.hash_search(&hashes, logic, options)?;
             Ok(serde_json::to_value(result)?)
         }
         "index_status" => {
@@ -358,6 +390,57 @@ fn parse_search_options(args: &Value) -> Result<SearchOptions> {
     Ok(options)
 }
 
+fn parse_hash_options(args: &Value) -> Result<HashSearchOptions> {
+    let mut options = HashSearchOptions::default();
+
+    if let Some(v) = args.get("include") {
+        options.include = parse_string_array(v, "include")?;
+    }
+    if let Some(v) = args.get("exclude") {
+        options.exclude = parse_string_array(v, "exclude")?;
+    }
+    if let Some(v) = args.get("globs") {
+        options.globs = parse_string_array(v, "globs")?;
+    }
+    if let Some(v) = args.get("max_results") {
+        options.max_results =
+            v.as_u64()
+                .ok_or_else(|| anyhow!("max_results must be an integer"))? as usize;
+    }
+    if let Some(v) = args.get("case_sensitive") {
+        options.case_sensitive = v
+            .as_bool()
+            .ok_or_else(|| anyhow!("case_sensitive must be boolean"))?;
+    }
+    if let Some(v) = args.get("no_snippet") {
+        options.no_snippet = v
+            .as_bool()
+            .ok_or_else(|| anyhow!("no_snippet must be boolean"))?;
+    }
+    if let Some(v) = args.get("verify_literal") {
+        options.verify_literal = Some(
+            v.as_str()
+                .ok_or_else(|| anyhow!("verify_literal must be a string"))?
+                .to_string(),
+        );
+    }
+    if let Some(v) = args.get("timeout_ms") {
+        options.timeout_ms = Some(
+            v.as_u64()
+                .ok_or_else(|| anyhow!("timeout_ms must be an integer"))?,
+        );
+    }
+    if let Some(v) = args.get("request_id") {
+        options.request_id = Some(
+            v.as_str()
+                .ok_or_else(|| anyhow!("request_id must be a string"))?
+                .to_string(),
+        );
+    }
+
+    Ok(options)
+}
+
 fn parse_string_array(value: &Value, field: &str) -> Result<Vec<String>> {
     let arr = value
         .as_array()
@@ -391,6 +474,27 @@ fn tools_manifest() -> Vec<Value> {
                 "properties": {
                     "pattern": { "type": "string" },
                     "options": { "type": "object" }
+                }
+            }
+        }),
+        json!({
+            "name": "hash_search",
+            "description": "Search using precomputed gram hashes (binary protocol). Optionally verify with a literal string.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["hashes"],
+                "properties": {
+                    "hashes": { "type": "array", "items": { "type": "integer" } },
+                    "logic": { "type": "string", "enum": ["and", "or"] },
+                    "verify_literal": { "type": "string" },
+                    "include": { "type": "array", "items": { "type": "string" } },
+                    "exclude": { "type": "array", "items": { "type": "string" } },
+                    "globs": { "type": "array", "items": { "type": "string" } },
+                    "max_results": { "type": "integer" },
+                    "case_sensitive": { "type": "boolean" },
+                    "no_snippet": { "type": "boolean" },
+                    "timeout_ms": { "type": "integer" },
+                    "request_id": { "type": "string" }
                 }
             }
         }),

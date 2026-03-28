@@ -8,7 +8,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
-use fastregex_core::{Engine, EngineConfig, SearchOptions};
+use fastregex_core::{Engine, EngineConfig, HashLogic, HashSearchOptions, SearchOptions, hash_gram};
 use pcre2::bytes::RegexBuilder;
 use serde_json::Value;
 use walkdir::WalkDir;
@@ -22,6 +22,7 @@ struct Config {
     no_snippet: bool,
     real_repo: Option<PathBuf>,
     patterns: Vec<String>,
+    hash_literal: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -70,7 +71,12 @@ fn main() -> Result<()> {
     let engine = Engine::new(engine_cfg)?;
     let status = engine.index_status()?;
 
-    let cases = if cfg.patterns.is_empty() {
+    let cases = if let Some(literal) = cfg.hash_literal.clone() {
+        vec![QueryCase {
+            name: "hash_literal".to_string(),
+            pattern: literal,
+        }]
+    } else if cfg.patterns.is_empty() {
         vec![
             QueryCase {
                 name: "Literal token".to_string(),
@@ -104,15 +110,27 @@ fn main() -> Result<()> {
     let mut query_results = Vec::new();
 
     for case in &cases {
-        let result = benchmark_case(
-            &engine,
-            &workspace_root,
-            &file_list,
-            status.indexed_docs,
-            case,
-            cfg.iterations,
-            cfg.no_snippet,
-        )?;
+        let result = if cfg.hash_literal.is_some() {
+            benchmark_hash_case(
+                &engine,
+                &workspace_root,
+                &file_list,
+                status.indexed_docs,
+                case,
+                cfg.iterations,
+                cfg.no_snippet,
+            )?
+        } else {
+            benchmark_case(
+                &engine,
+                &workspace_root,
+                &file_list,
+                status.indexed_docs,
+                case,
+                cfg.iterations,
+                cfg.no_snippet,
+            )?
+        };
         query_results.push(result);
     }
 
@@ -139,6 +157,7 @@ fn parse_args() -> Result<Config> {
         no_snippet: true,
         real_repo: None,
         patterns: Vec::new(),
+        hash_literal: None,
     };
 
     let mut args = env::args().skip(1);
@@ -165,6 +184,10 @@ fn parse_args() -> Result<Config> {
             "--pattern" => {
                 let value = args.next().context("missing value for --pattern")?;
                 cfg.patterns.push(value);
+            }
+            "--hash-literal" => {
+                let value = args.next().context("missing value for --hash-literal")?;
+                cfg.hash_literal = Some(value);
             }
             other => return Err(anyhow!("unknown argument: {other}")),
         }
@@ -402,6 +425,87 @@ fn benchmark_case(
     })
 }
 
+fn benchmark_hash_case(
+    engine: &Engine,
+    dataset_root: &Path,
+    files: &[PathBuf],
+    total_docs: usize,
+    case: &QueryCase,
+    iterations: usize,
+    no_snippet: bool,
+) -> Result<QueryResult> {
+    let mut options = HashSearchOptions::default();
+    options.max_results = 250_000;
+    options.no_snippet = no_snippet;
+    options.verify_literal = Some(case.pattern.clone());
+
+    let hashes = literal_trigram_hashes(case.pattern.as_bytes());
+
+    // Establish expected match count from full scan.
+    let expected_matches = run_full_scan(files, &escape_literal(case.pattern.as_str()))?;
+    let warm = engine.hash_search(&hashes, HashLogic::And, options.clone())?;
+    if warm.matches.len() != expected_matches {
+        return Err(anyhow!(
+            "hash_search count mismatch for pattern '{}': expected {}, got {}",
+            case.pattern,
+            expected_matches,
+            warm.matches.len()
+        ));
+    }
+
+    let _ = run_ripgrep(dataset_root, case.pattern.as_str())?;
+
+    let mut fast_times = Vec::<f64>::new();
+    let mut rg_times = Vec::<f64>::new();
+    let mut full_times = Vec::<f64>::new();
+    let mut candidate_counts = Vec::<usize>::new();
+
+    for _ in 0..iterations {
+        let t0 = Instant::now();
+        let fast = engine.hash_search(&hashes, HashLogic::And, options.clone())?;
+        fast_times.push(elapsed_ms(t0.elapsed()));
+        candidate_counts.push(fast.candidate_count);
+
+        let t1 = Instant::now();
+        let rg_count = run_ripgrep(dataset_root, case.pattern.as_str())?;
+        rg_times.push(elapsed_ms(t1.elapsed()));
+        if rg_count != expected_matches {
+            eprintln!(
+                "warning: ripgrep count mismatch for pattern '{}': expected {}, got {}",
+                case.pattern, expected_matches, rg_count
+            );
+        }
+
+        let t2 = Instant::now();
+        let full_count = run_full_scan(files, &escape_literal(case.pattern.as_str()))?;
+        full_times.push(elapsed_ms(t2.elapsed()));
+        if full_count != expected_matches {
+            return Err(anyhow!(
+                "full-scan count mismatch for pattern '{}': expected {}, got {}",
+                case.pattern,
+                expected_matches,
+                full_count
+            ));
+        }
+    }
+
+    let candidate_count = percentile_usize(candidate_counts, 0.5);
+
+    Ok(QueryResult {
+        name: case.name.to_string(),
+        pattern: case.pattern.to_string(),
+        match_count: expected_matches,
+        candidate_count,
+        total_docs,
+        fast_p50_ms: percentile(fast_times.clone(), 0.5),
+        fast_p95_ms: percentile(fast_times, 0.95),
+        rg_p50_ms: percentile(rg_times.clone(), 0.5),
+        rg_p95_ms: percentile(rg_times, 0.95),
+        full_scan_p50_ms: percentile(full_times.clone(), 0.5),
+        full_scan_p95_ms: percentile(full_times, 0.95),
+    })
+}
+
 fn collect_text_files(root: &Path) -> Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     for entry in WalkDir::new(root)
@@ -499,6 +603,35 @@ fn run_full_scan(files: &[PathBuf], pattern: &str) -> Result<usize> {
     }
 
     Ok(matches)
+}
+
+fn literal_trigram_hashes(literal: &[u8]) -> Vec<u64> {
+    if literal.len() < 3 {
+        return Vec::new();
+    }
+    let mut out = Vec::<u64>::new();
+    let mut seen = std::collections::HashSet::new();
+    for tri in literal.windows(3) {
+        let h = hash_gram(tri);
+        if seen.insert(h) {
+            out.push(h);
+        }
+    }
+    out
+}
+
+fn escape_literal(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '.' | '^' | '$' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '\\' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 fn elapsed_ms(duration: Duration) -> f64 {
