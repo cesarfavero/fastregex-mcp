@@ -37,6 +37,8 @@ pub struct SearchOptions {
     pub multiline: bool,
     #[serde(default)]
     pub no_snippet: bool,
+    #[serde(default)]
+    pub literal: bool,
     pub timeout_ms: Option<u64>,
     pub request_id: Option<String>,
 }
@@ -52,6 +54,7 @@ impl Default for SearchOptions {
             dotall: false,
             multiline: false,
             no_snippet: false,
+            literal: false,
             timeout_ms: None,
             request_id: None,
         }
@@ -219,8 +222,13 @@ impl Engine {
         regex_builder.caseless(!options.case_sensitive);
         regex_builder.dotall(options.dotall);
         regex_builder.multi_line(options.multiline);
+        let (regex_pattern, plan_pattern) = if options.literal {
+            (escape_literal_for_pcre2(pattern), pattern)
+        } else {
+            (pattern.to_string(), pattern)
+        };
         let regex = regex_builder
-            .build(pattern)
+            .build(&regex_pattern)
             .map_err(|err| FastRegexError::RegexCompile(err.to_string()))?;
 
         let deadline = options
@@ -234,7 +242,7 @@ impl Engine {
 
         let filter = PathFilter::new(&options.include, &options.globs, &options.exclude)?;
         let plan = build_query_plan(
-            pattern,
+            plan_pattern,
             &index.bigram_frequency,
             self.inner.config.build.sparse_config(),
         );
@@ -760,6 +768,20 @@ fn build_line_starts(bytes: &[u8]) -> Vec<usize> {
     }
 
     starts
+}
+
+fn escape_literal_for_pcre2(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '.' | '^' | '$' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '\\' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 fn intersect_sorted_doc_ids(left: &[u32], right: &[u32]) -> Vec<u32> {

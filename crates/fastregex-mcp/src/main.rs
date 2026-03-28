@@ -331,6 +331,11 @@ fn parse_search_options(args: &Value) -> Result<SearchOptions> {
             .as_bool()
             .ok_or_else(|| anyhow!("multiline must be boolean"))?;
     }
+    if let Some(v) = args.get("literal") {
+        options.literal = v
+            .as_bool()
+            .ok_or_else(|| anyhow!("literal must be boolean"))?;
+    }
     if let Some(v) = args.get("no_snippet") {
         options.no_snippet = v
             .as_bool()

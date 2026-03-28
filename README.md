@@ -15,8 +15,6 @@ Agent loops often call `rg` repeatedly and full-scan large monorepos. This proje
 3. Reduce candidate docs through posting list combination.
 4. Run final PCRE2 verification only on candidates.
 
-Design reference (same direction, local-first): [Cursor blog: Fast regex search](https://cursor.com/blog/fast-regex-search).
-
 ## Workspace layout
 
 - `crates/fastregex-core`: index builder, sparse/trigram extraction, planner, overlay merge, PCRE2 final matcher.
@@ -107,6 +105,21 @@ npx @smithery/cli@latest skill add fastregex-policy - < wrappers/skills/fastrege
 - `index_status()`
 - `index_update_files(changed_files[])`
 - `index_rebuild(mode)` where `mode` is `foreground` or `background`
+
+### IA query hints (optional)
+
+To optimize for literal, “surgical” searches from agents, pass:
+
+```json
+{
+  "pattern": "exact phrase here",
+  "literal": true,
+  "max_results": 20,
+  "no_snippet": true
+}
+```
+
+`literal=true` escapes regex metacharacters and forces a literal plan.
 
 ## Correctness guarantees
 
