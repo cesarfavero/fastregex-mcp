@@ -198,6 +198,10 @@ fn handle_request(engine: &Engine, request: RpcRequest) -> Result<Value> {
             let args = request.params.unwrap_or_else(|| json!({}));
             dispatch_tool(engine, "regex_search", args)
         }
+        "hot_search" => {
+            let args = request.params.unwrap_or_else(|| json!({}));
+            dispatch_tool(engine, "hot_search", args)
+        }
         "hash_search" => {
             let args = request.params.unwrap_or_else(|| json!({}));
             dispatch_tool(engine, "hash_search", args)
@@ -262,6 +266,16 @@ fn dispatch_tool(engine: &Engine, name: &str, args: Value) -> Result<Value> {
 
             let options = parse_search_options(&args)?;
             let result = engine.regex_search(pattern, options)?;
+            Ok(serde_json::to_value(result)?)
+        }
+        "hot_search" => {
+            let pattern = args
+                .get("pattern")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("hot_search requires 'pattern'"))?;
+
+            let options = parse_search_options(&args)?;
+            let result = engine.hot_search(pattern, options)?;
             Ok(serde_json::to_value(result)?)
         }
         "hash_search" => {
@@ -468,6 +482,18 @@ fn tools_manifest() -> Vec<Value> {
         json!({
             "name": "regex_search",
             "description": "Search files with PCRE2 final verification using fast indexed candidate selection.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["pattern"],
+                "properties": {
+                    "pattern": { "type": "string" },
+                    "options": { "type": "object" }
+                }
+            }
+        }),
+        json!({
+            "name": "hot_search",
+            "description": "Search only within the hot cache (recently accessed files).",
             "inputSchema": {
                 "type": "object",
                 "required": ["pattern"],

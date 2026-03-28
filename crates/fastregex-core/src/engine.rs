@@ -1,11 +1,11 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use pcre2::bytes::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 
@@ -207,6 +207,7 @@ struct EngineInner {
     base: RwLock<BaseIndexState>,
     overlay: OverlayStore,
     rebuild_state: RwLock<RebuildState>,
+    hot_cache: Mutex<HotCache>,
 }
 
 #[derive(Clone, Debug)]
@@ -244,6 +245,7 @@ impl Engine {
                 base: RwLock::new(base),
                 overlay: OverlayStore::default(),
                 rebuild_state: RwLock::new(RebuildState::Idle),
+                hot_cache: Mutex::new(HotCache::new(128)),
             }),
         })
     }
@@ -278,7 +280,7 @@ impl Engine {
             .timeout_ms
             .map(|ms| (Instant::now() + Duration::from_millis(ms), ms));
 
-        let (index, base_generation) = {
+        let (_index, base_generation) = {
             let base = self.inner.base.read();
             (Arc::clone(&base.snapshot), base.generation)
         };
@@ -345,6 +347,10 @@ impl Engine {
                 &options.request_id,
                 !options.no_snippet,
             )?;
+            self.inner
+                .hot_cache
+                .lock()
+                .insert(doc.path.clone(), bytes);
 
             if out.len() >= max_results {
                 break;
@@ -370,6 +376,10 @@ impl Engine {
                         &options.request_id,
                         !options.no_snippet,
                     )?;
+                    self.inner
+                        .hot_cache
+                        .lock()
+                        .insert(path.clone(), file.text.as_bytes().to_vec());
                 }
 
                 if out.len() >= max_results {
@@ -409,6 +419,80 @@ impl Engine {
             rebuild_state: self.inner.rebuild_state.read().clone(),
             indexed_docs: base.snapshot.docs.len(),
             base_generation: base.generation,
+        })
+    }
+
+    pub fn hot_search(&self, pattern: &str, options: SearchOptions) -> Result<SearchResponse> {
+        if pattern.is_empty() {
+            return Err(FastRegexError::InvalidRequest(
+                "pattern cannot be empty".to_string(),
+            ));
+        }
+
+        let max_results = if options.max_results == 0 {
+            default_max_results()
+        } else {
+            options.max_results
+        };
+
+        let mut regex_builder = RegexBuilder::new();
+        regex_builder.caseless(!options.case_sensitive);
+        regex_builder.dotall(options.dotall);
+        regex_builder.multi_line(options.multiline);
+        let (regex_pattern, _plan_pattern) = if options.literal {
+            (escape_literal_for_pcre2(pattern), pattern)
+        } else {
+            (pattern.to_string(), pattern)
+        };
+        let regex = regex_builder
+            .build(&regex_pattern)
+            .map_err(|err| FastRegexError::RegexCompile(err.to_string()))?;
+
+        let deadline = options
+            .timeout_ms
+            .map(|ms| (Instant::now() + Duration::from_millis(ms), ms));
+
+        let (index, base_generation) = {
+            let base = self.inner.base.read();
+            (Arc::clone(&base.snapshot), base.generation)
+        };
+
+        let filter = PathFilter::new(&options.include, &options.globs, &options.exclude)?;
+        let overlay_generation = self.inner.overlay.snapshot().generation;
+
+        let hot_entries = self.inner.hot_cache.lock().entries();
+
+        let mut out = Vec::<SearchMatch>::new();
+        let mut candidate_count = 0usize;
+
+        for (path, bytes) in hot_entries {
+            check_deadline(deadline, &options.request_id)?;
+            if !filter.allows(&path) {
+                continue;
+            }
+            candidate_count += 1;
+            scan_candidate(
+                &regex,
+                &path,
+                &bytes,
+                &mut out,
+                max_results,
+                deadline,
+                &options.request_id,
+                !options.no_snippet,
+            )?;
+            if out.len() >= max_results {
+                break;
+            }
+        }
+
+        Ok(SearchResponse {
+            matches: out,
+            candidate_count,
+            used_fallback: false,
+            extracted_literals: Vec::new(),
+            base_generation,
+            overlay_generation,
         })
     }
 
@@ -1039,6 +1123,52 @@ fn intersect_sorted_doc_ids(left: &[u32], right: &[u32]) -> Vec<u32> {
     }
 
     out
+}
+
+#[derive(Debug)]
+struct HotCache {
+    cap: usize,
+    order: VecDeque<String>,
+    map: HashMap<String, Vec<u8>>,
+}
+
+impl HotCache {
+    fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            order: VecDeque::new(),
+            map: HashMap::new(),
+        }
+    }
+
+    fn insert(&mut self, path: String, bytes: Vec<u8>) {
+        if self.map.contains_key(&path) {
+            self.map.insert(path.clone(), bytes);
+            self.bump(&path);
+            return;
+        }
+        if self.map.len() >= self.cap {
+            if let Some(old) = self.order.pop_front() {
+                self.map.remove(&old);
+            }
+        }
+        self.map.insert(path.clone(), bytes);
+        self.order.push_back(path);
+    }
+
+    fn bump(&mut self, path: &str) {
+        if let Some(pos) = self.order.iter().position(|p| p == path) {
+            self.order.remove(pos);
+            self.order.push_back(path.to_string());
+        }
+    }
+
+    fn entries(&mut self) -> Vec<(String, Vec<u8>)> {
+        self.order
+            .iter()
+            .filter_map(|path| self.map.get(path).map(|bytes| (path.clone(), bytes.clone())))
+            .collect()
+    }
 }
 
 fn overlay_hash_match(file_hashes: &HashSet<u64>, hashes: &[u64], logic: HashLogic) -> bool {

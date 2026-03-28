@@ -134,6 +134,18 @@ For IA-native binary queries, use `hash_search` with precomputed trigram hashes 
 }
 ```
 
+### hot_search (hot cache)
+
+For IA workflows that revisit recently opened files, call `hot_search` before `regex_search`:
+
+```json
+{
+  "pattern": "exact phrase here",
+  "literal": true,
+  "no_snippet": true
+}
+```
+
 ## Correctness guarantees
 
 - Final match engine is always **PCRE2**.
