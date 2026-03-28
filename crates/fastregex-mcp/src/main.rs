@@ -206,6 +206,10 @@ fn handle_request(engine: &Engine, request: RpcRequest) -> Result<Value> {
             let args = request.params.unwrap_or_else(|| json!({}));
             dispatch_tool(engine, "hash_search", args)
         }
+        "literal_search" => {
+            let args = request.params.unwrap_or_else(|| json!({}));
+            dispatch_tool(engine, "literal_search", args)
+        }
         "index_status" => dispatch_tool(engine, "index_status", json!({})),
         "index_update_files" => {
             let args = request.params.unwrap_or_else(|| json!({}));
@@ -306,6 +310,15 @@ fn dispatch_tool(engine: &Engine, name: &str, args: Value) -> Result<Value> {
             let result = engine.hash_search(&hashes, logic, options)?;
             Ok(serde_json::to_value(result)?)
         }
+        "literal_search" => {
+            let pattern = args
+                .get("pattern")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("literal_search requires 'pattern'"))?;
+            let options = parse_search_options(&args)?;
+            let result = engine.literal_search(pattern, options)?;
+            Ok(serde_json::to_value(result)?)
+        }
         "index_status" => {
             let result = engine.index_status()?;
             Ok(serde_json::to_value(result)?)
@@ -382,6 +395,23 @@ fn parse_search_options(args: &Value) -> Result<SearchOptions> {
             .as_bool()
             .ok_or_else(|| anyhow!("literal must be boolean"))?;
     }
+    if let Some(v) = args.get("parallel") {
+        options.parallel = v
+            .as_bool()
+            .ok_or_else(|| anyhow!("parallel must be boolean"))?;
+    }
+    if let Some(v) = args.get("return_mode") {
+        let mode = v
+            .as_str()
+            .ok_or_else(|| anyhow!("return_mode must be a string"))?;
+        options.return_mode = match mode {
+            "matches" => fastregex_core::ReturnMode::Matches,
+            "ids" => fastregex_core::ReturnMode::Ids,
+            "paths" => fastregex_core::ReturnMode::Paths,
+            "count" => fastregex_core::ReturnMode::Count,
+            other => return Err(anyhow!("invalid return_mode '{other}'")),
+        };
+    }
     if let Some(v) = args.get("no_snippet") {
         options.no_snippet = v
             .as_bool()
@@ -438,6 +468,18 @@ fn parse_hash_options(args: &Value) -> Result<HashSearchOptions> {
                 .to_string(),
         );
     }
+    if let Some(v) = args.get("return_mode") {
+        let mode = v
+            .as_str()
+            .ok_or_else(|| anyhow!("return_mode must be a string"))?;
+        options.return_mode = match mode {
+            "matches" => fastregex_core::ReturnMode::Matches,
+            "ids" => fastregex_core::ReturnMode::Ids,
+            "paths" => fastregex_core::ReturnMode::Paths,
+            "count" => fastregex_core::ReturnMode::Count,
+            other => return Err(anyhow!("invalid return_mode '{other}'")),
+        };
+    }
     if let Some(v) = args.get("timeout_ms") {
         options.timeout_ms = Some(
             v.as_u64()
@@ -487,7 +529,9 @@ fn tools_manifest() -> Vec<Value> {
                 "required": ["pattern"],
                 "properties": {
                     "pattern": { "type": "string" },
-                    "options": { "type": "object" }
+                    "options": { "type": "object" },
+                    "return_mode": { "type": "string", "enum": ["matches", "ids", "paths", "count"] },
+                    "parallel": { "type": "boolean" }
                 }
             }
         }),
@@ -499,7 +543,8 @@ fn tools_manifest() -> Vec<Value> {
                 "required": ["pattern"],
                 "properties": {
                     "pattern": { "type": "string" },
-                    "options": { "type": "object" }
+                    "options": { "type": "object" },
+                    "return_mode": { "type": "string", "enum": ["matches", "ids", "paths", "count"] }
                 }
             }
         }),
@@ -513,6 +558,7 @@ fn tools_manifest() -> Vec<Value> {
                     "hashes": { "type": "array", "items": { "type": "integer" } },
                     "logic": { "type": "string", "enum": ["and", "or"] },
                     "verify_literal": { "type": "string" },
+                    "return_mode": { "type": "string", "enum": ["matches", "ids", "paths", "count"] },
                     "include": { "type": "array", "items": { "type": "string" } },
                     "exclude": { "type": "array", "items": { "type": "string" } },
                     "globs": { "type": "array", "items": { "type": "string" } },
@@ -521,6 +567,19 @@ fn tools_manifest() -> Vec<Value> {
                     "no_snippet": { "type": "boolean" },
                     "timeout_ms": { "type": "integer" },
                     "request_id": { "type": "string" }
+                }
+            }
+        }),
+        json!({
+            "name": "literal_search",
+            "description": "Fast literal search without regex.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["pattern"],
+                "properties": {
+                    "pattern": { "type": "string" },
+                    "options": { "type": "object" },
+                    "return_mode": { "type": "string", "enum": ["matches", "ids", "paths", "count"] }
                 }
             }
         }),

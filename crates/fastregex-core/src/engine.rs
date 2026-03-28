@@ -6,6 +6,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use parking_lot::{Mutex, RwLock};
+use memchr::memmem;
+use rayon::prelude::*;
 use pcre2::bytes::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 
@@ -39,8 +41,27 @@ pub struct SearchOptions {
     pub no_snippet: bool,
     #[serde(default)]
     pub literal: bool,
+    #[serde(default)]
+    pub parallel: bool,
+    #[serde(default)]
+    pub return_mode: ReturnMode,
     pub timeout_ms: Option<u64>,
     pub request_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReturnMode {
+    Matches,
+    Ids,
+    Paths,
+    Count,
+}
+
+impl Default for ReturnMode {
+    fn default() -> Self {
+        ReturnMode::Matches
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -66,6 +87,8 @@ pub struct HashSearchOptions {
     pub no_snippet: bool,
     #[serde(default)]
     pub verify_literal: Option<String>,
+    #[serde(default)]
+    pub return_mode: ReturnMode,
     pub timeout_ms: Option<u64>,
     pub request_id: Option<String>,
 }
@@ -80,6 +103,7 @@ impl Default for HashSearchOptions {
             case_sensitive: default_case_sensitive(),
             no_snippet: false,
             verify_literal: None,
+            return_mode: ReturnMode::Matches,
             timeout_ms: None,
             request_id: None,
         }
@@ -98,6 +122,8 @@ impl Default for SearchOptions {
             multiline: false,
             no_snippet: false,
             literal: false,
+            parallel: false,
+            return_mode: ReturnMode::Matches,
             timeout_ms: None,
             request_id: None,
         }
@@ -130,6 +156,12 @@ pub struct SearchResponse {
     pub extracted_literals: Vec<String>,
     pub base_generation: u64,
     pub overlay_generation: u64,
+    #[serde(default)]
+    pub candidate_doc_ids: Vec<u32>,
+    #[serde(default)]
+    pub candidate_paths: Vec<String>,
+    #[serde(default)]
+    pub return_mode: ReturnMode,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -208,6 +240,7 @@ struct EngineInner {
     overlay: OverlayStore,
     rebuild_state: RwLock<RebuildState>,
     hot_cache: Mutex<HotCache>,
+    regex_cache: Mutex<RegexCache>,
 }
 
 #[derive(Clone, Debug)]
@@ -246,6 +279,7 @@ impl Engine {
                 overlay: OverlayStore::default(),
                 rebuild_state: RwLock::new(RebuildState::Idle),
                 hot_cache: Mutex::new(HotCache::new(128)),
+                regex_cache: Mutex::new(RegexCache::new(64)),
             }),
         })
     }
@@ -263,24 +297,33 @@ impl Engine {
             options.max_results
         };
 
-        let mut regex_builder = RegexBuilder::new();
-        regex_builder.caseless(!options.case_sensitive);
-        regex_builder.dotall(options.dotall);
-        regex_builder.multi_line(options.multiline);
         let (regex_pattern, plan_pattern) = if options.literal {
             (escape_literal_for_pcre2(pattern), pattern)
         } else {
             (pattern.to_string(), pattern)
         };
-        let regex = regex_builder
-            .build(&regex_pattern)
-            .map_err(|err| FastRegexError::RegexCompile(err.to_string()))?;
+        let regex = self.inner.regex_cache.lock().get_or_build(
+            &regex_pattern,
+            options.case_sensitive,
+            options.dotall,
+            options.multiline,
+            || {
+                let mut builder = RegexBuilder::new();
+                builder.caseless(!options.case_sensitive);
+                builder.dotall(options.dotall);
+                builder.multi_line(options.multiline);
+                builder.jit_if_available(true);
+                builder
+                    .build(&regex_pattern)
+                    .map_err(|err| FastRegexError::RegexCompile(err.to_string()))
+            },
+        )?;
 
         let deadline = options
             .timeout_ms
             .map(|ms| (Instant::now() + Duration::from_millis(ms), ms));
 
-        let (_index, base_generation) = {
+        let (index, base_generation) = {
             let base = self.inner.base.read();
             (Arc::clone(&base.snapshot), base.generation)
         };
@@ -324,36 +367,98 @@ impl Engine {
 
         let candidate_count = base_ids.len() + overlay_candidates.len();
 
+        let mut candidate_doc_ids = Vec::<u32>::new();
+        let mut candidate_paths = Vec::<String>::new();
+        for doc_id in &base_ids {
+            if let Some(doc) = index.doc_by_id(*doc_id) {
+                candidate_doc_ids.push(doc.doc_id);
+                candidate_paths.push(doc.path.clone());
+            }
+        }
+        for path in &overlay_candidates {
+            candidate_paths.push(path.clone());
+        }
+
+        if !matches!(options.return_mode, ReturnMode::Matches) {
+            return Ok(SearchResponse {
+                matches: Vec::new(),
+                candidate_count,
+                used_fallback: plan.used_fallback,
+                extracted_literals: plan.extracted_literals,
+                base_generation,
+                overlay_generation,
+                candidate_doc_ids,
+                candidate_paths,
+                return_mode: options.return_mode,
+            });
+        }
+
         let mut out = Vec::<SearchMatch>::new();
 
-        for doc_id in base_ids {
-            check_deadline(deadline, &options.request_id)?;
+        if options.parallel && base_ids.len() > 32 {
+            let regex = Arc::clone(&regex);
+            let results: Vec<Vec<SearchMatch>> = base_ids
+                .par_iter()
+                .map(|doc_id| {
+                    let mut local = Vec::new();
+                    let Some(doc) = index.doc_by_id(*doc_id) else {
+                        return local;
+                    };
+                    let Some(bytes) =
+                        read_bytes(&self.inner.config.workspace_root.join(&doc.path)).ok().flatten()
+                    else {
+                        return local;
+                    };
+                    let _ = scan_candidate(
+                        regex.as_ref(),
+                        &doc.path,
+                        &bytes,
+                        &mut local,
+                        max_results,
+                        deadline,
+                        &options.request_id,
+                        !options.no_snippet,
+                    );
+                    local
+                })
+                .collect();
+            for mut part in results {
+                out.append(&mut part);
+                if out.len() >= max_results {
+                    break;
+                }
+            }
+        } else {
+            for doc_id in base_ids {
+                check_deadline(deadline, &options.request_id)?;
 
-            let Some(doc) = index.doc_by_id(doc_id) else {
-                continue;
-            };
+                let Some(doc) = index.doc_by_id(doc_id) else {
+                    continue;
+                };
 
-            let Some(bytes) = read_bytes(&self.inner.config.workspace_root.join(&doc.path))? else {
-                continue;
-            };
+                let Some(bytes) = read_bytes(&self.inner.config.workspace_root.join(&doc.path))?
+                else {
+                    continue;
+                };
 
-            scan_candidate(
-                &regex,
-                &doc.path,
-                &bytes,
-                &mut out,
-                max_results,
-                deadline,
-                &options.request_id,
-                !options.no_snippet,
-            )?;
-            self.inner
-                .hot_cache
-                .lock()
-                .insert(doc.path.clone(), bytes);
+                scan_candidate(
+                    regex.as_ref(),
+                    &doc.path,
+                    &bytes,
+                    &mut out,
+                    max_results,
+                    deadline,
+                    &options.request_id,
+                    !options.no_snippet,
+                )?;
+                self.inner
+                    .hot_cache
+                    .lock()
+                    .insert(doc.path.clone(), bytes);
 
-            if out.len() >= max_results {
-                break;
+                if out.len() >= max_results {
+                    break;
+                }
             }
         }
 
@@ -367,7 +472,7 @@ impl Engine {
 
                 if let OverlayEntry::Modified(file) = entry {
                     scan_candidate(
-                        &regex,
+                        regex.as_ref(),
                         &path,
                         file.text.as_bytes(),
                         &mut out,
@@ -395,6 +500,9 @@ impl Engine {
             extracted_literals: plan.extracted_literals,
             base_generation,
             overlay_generation,
+            candidate_doc_ids,
+            candidate_paths,
+            return_mode: options.return_mode,
         })
     }
 
@@ -435,24 +543,33 @@ impl Engine {
             options.max_results
         };
 
-        let mut regex_builder = RegexBuilder::new();
-        regex_builder.caseless(!options.case_sensitive);
-        regex_builder.dotall(options.dotall);
-        regex_builder.multi_line(options.multiline);
         let (regex_pattern, _plan_pattern) = if options.literal {
             (escape_literal_for_pcre2(pattern), pattern)
         } else {
             (pattern.to_string(), pattern)
         };
-        let regex = regex_builder
-            .build(&regex_pattern)
-            .map_err(|err| FastRegexError::RegexCompile(err.to_string()))?;
+        let regex = self.inner.regex_cache.lock().get_or_build(
+            &regex_pattern,
+            options.case_sensitive,
+            options.dotall,
+            options.multiline,
+            || {
+                let mut builder = RegexBuilder::new();
+                builder.caseless(!options.case_sensitive);
+                builder.dotall(options.dotall);
+                builder.multi_line(options.multiline);
+                builder.jit_if_available(true);
+                builder
+                    .build(&regex_pattern)
+                    .map_err(|err| FastRegexError::RegexCompile(err.to_string()))
+            },
+        )?;
 
         let deadline = options
             .timeout_ms
             .map(|ms| (Instant::now() + Duration::from_millis(ms), ms));
 
-        let (index, base_generation) = {
+        let (_index, base_generation) = {
             let base = self.inner.base.read();
             (Arc::clone(&base.snapshot), base.generation)
         };
@@ -464,6 +581,7 @@ impl Engine {
 
         let mut out = Vec::<SearchMatch>::new();
         let mut candidate_count = 0usize;
+        let mut candidate_paths = Vec::<String>::new();
 
         for (path, bytes) in hot_entries {
             check_deadline(deadline, &options.request_id)?;
@@ -471,8 +589,13 @@ impl Engine {
                 continue;
             }
             candidate_count += 1;
+            candidate_paths.push(path.clone());
+
+            if !matches!(options.return_mode, ReturnMode::Matches) {
+                continue;
+            }
             scan_candidate(
-                &regex,
+                regex.as_ref(),
                 &path,
                 &bytes,
                 &mut out,
@@ -493,6 +616,202 @@ impl Engine {
             extracted_literals: Vec::new(),
             base_generation,
             overlay_generation,
+            candidate_doc_ids: Vec::new(),
+            candidate_paths,
+            return_mode: options.return_mode,
+        })
+    }
+
+    pub fn literal_search(&self, literal: &str, options: SearchOptions) -> Result<SearchResponse> {
+        if literal.is_empty() {
+            return Err(FastRegexError::InvalidRequest(
+                "pattern cannot be empty".to_string(),
+            ));
+        }
+
+        if !options.case_sensitive {
+            let mut fallback = options.clone();
+            fallback.literal = true;
+            return self.regex_search(literal, fallback);
+        }
+
+        let max_results = if options.max_results == 0 {
+            default_max_results()
+        } else {
+            options.max_results
+        };
+
+        let deadline = options
+            .timeout_ms
+            .map(|ms| (Instant::now() + Duration::from_millis(ms), ms));
+
+        let (index, base_generation) = {
+            let base = self.inner.base.read();
+            (Arc::clone(&base.snapshot), base.generation)
+        };
+
+        let filter = PathFilter::new(&options.include, &options.globs, &options.exclude)?;
+        let plan = build_query_plan(
+            literal,
+            &index.bigram_frequency,
+            self.inner.config.build.sparse_config(),
+        );
+
+        let mut base_candidates = self.base_candidates(&index, &plan.expr, &filter)?;
+        let overlay_snapshot = self.inner.overlay.snapshot();
+        let overlay_generation = overlay_snapshot.generation;
+
+        let mut overlay_candidates = Vec::<String>::new();
+        for (path, entry) in &overlay_snapshot.files {
+            if let Some(doc_id) = index.doc_id_for_path(path) {
+                base_candidates.remove(&doc_id);
+            }
+            if !filter.allows(path) {
+                continue;
+            }
+            match entry {
+                OverlayEntry::Deleted => {}
+                OverlayEntry::Modified(file) => {
+                    if plan.matches_hashes(&file.gram_hashes) {
+                        overlay_candidates.push(path.clone());
+                    }
+                }
+            }
+        }
+
+        let mut base_ids: Vec<u32> = base_candidates.into_iter().collect();
+        base_ids.sort_unstable();
+        overlay_candidates.sort();
+        overlay_candidates.dedup();
+
+        let candidate_count = base_ids.len() + overlay_candidates.len();
+        let mut candidate_doc_ids = Vec::<u32>::new();
+        let mut candidate_paths = Vec::<String>::new();
+        for doc_id in &base_ids {
+            if let Some(doc) = index.doc_by_id(*doc_id) {
+                candidate_doc_ids.push(doc.doc_id);
+                candidate_paths.push(doc.path.clone());
+            }
+        }
+        for path in &overlay_candidates {
+            candidate_paths.push(path.clone());
+        }
+
+        if !matches!(options.return_mode, ReturnMode::Matches) {
+            return Ok(SearchResponse {
+                matches: Vec::new(),
+                candidate_count,
+                used_fallback: plan.used_fallback,
+                extracted_literals: plan.extracted_literals,
+                base_generation,
+                overlay_generation,
+                candidate_doc_ids,
+                candidate_paths,
+                return_mode: options.return_mode,
+            });
+        }
+
+        let mut out = Vec::<SearchMatch>::new();
+
+        if options.parallel && base_ids.len() > 32 {
+            let literal_bytes = literal.as_bytes().to_vec();
+            let results: Vec<Vec<SearchMatch>> = base_ids
+                .par_iter()
+                .map(|doc_id| {
+                    let mut local = Vec::new();
+                    let Some(doc) = index.doc_by_id(*doc_id) else {
+                        return local;
+                    };
+                    let Some(bytes) =
+                        read_bytes(&self.inner.config.workspace_root.join(&doc.path)).ok().flatten()
+                    else {
+                        return local;
+                    };
+                    let _ = scan_literal_candidate(
+                        &literal_bytes,
+                        &doc.path,
+                        &bytes,
+                        &mut local,
+                        max_results,
+                        deadline,
+                        &options.request_id,
+                        !options.no_snippet,
+                    );
+                    local
+                })
+                .collect();
+            for mut part in results {
+                out.append(&mut part);
+                if out.len() >= max_results {
+                    break;
+                }
+            }
+        } else {
+            for doc_id in base_ids {
+                check_deadline(deadline, &options.request_id)?;
+                let Some(doc) = index.doc_by_id(doc_id) else {
+                    continue;
+                };
+                let Some(bytes) = read_bytes(&self.inner.config.workspace_root.join(&doc.path))?
+                else {
+                    continue;
+                };
+
+                scan_literal_candidate(
+                    literal.as_bytes(),
+                    &doc.path,
+                    &bytes,
+                    &mut out,
+                    max_results,
+                    deadline,
+                    &options.request_id,
+                    !options.no_snippet,
+                )?;
+                self.inner
+                    .hot_cache
+                    .lock()
+                    .insert(doc.path.clone(), bytes);
+
+                if out.len() >= max_results {
+                    break;
+                }
+            }
+        }
+
+        if out.len() < max_results {
+            for path in overlay_candidates {
+                check_deadline(deadline, &options.request_id)?;
+                let Some(entry) = overlay_snapshot.files.get(&path) else {
+                    continue;
+                };
+                if let OverlayEntry::Modified(file) = entry {
+                    scan_literal_candidate(
+                        literal.as_bytes(),
+                        &path,
+                        file.text.as_bytes(),
+                        &mut out,
+                        max_results,
+                        deadline,
+                        &options.request_id,
+                        !options.no_snippet,
+                    )?;
+                }
+                if out.len() >= max_results {
+                    break;
+                }
+            }
+        }
+
+        Ok(SearchResponse {
+            matches: out,
+            candidate_count,
+            used_fallback: plan.used_fallback,
+            extracted_literals: plan.extracted_literals,
+            base_generation,
+            overlay_generation,
+            candidate_doc_ids: Vec::new(),
+            candidate_paths: Vec::new(),
+            return_mode: options.return_mode,
         })
     }
 
@@ -551,16 +870,57 @@ impl Engine {
         let candidate_count = base_ids.len() + overlay_candidates.len();
 
         let mut out = Vec::<SearchMatch>::new();
+        let mut candidate_doc_ids = Vec::<u32>::new();
+        let mut candidate_paths = Vec::<String>::new();
         let mut regex = None;
         if let Some(literal) = options.verify_literal.as_deref() {
-            let mut builder = RegexBuilder::new();
-            builder.caseless(!options.case_sensitive);
             let escaped = escape_literal_for_pcre2(literal);
-            regex = Some(
-                builder
-                    .build(&escaped)
-                    .map_err(|err| FastRegexError::RegexCompile(err.to_string()))?,
-            );
+            let re = self.inner.regex_cache.lock().get_or_build(
+                &escaped,
+                options.case_sensitive,
+                false,
+                false,
+                || {
+                    let mut builder = RegexBuilder::new();
+                    builder.caseless(!options.case_sensitive);
+                    builder.jit_if_available(true);
+                    builder
+                        .build(&escaped)
+                        .map_err(|err| FastRegexError::RegexCompile(err.to_string()))
+                },
+            )?;
+            regex = Some(re);
+        }
+
+        if regex.is_none() && matches!(options.return_mode, ReturnMode::Matches) {
+            return Err(FastRegexError::InvalidRequest(
+                "hash_search requires verify_literal for return_mode=matches".to_string(),
+            ));
+        }
+
+        if regex.is_none()
+            && matches!(
+                options.return_mode,
+                ReturnMode::Ids | ReturnMode::Paths | ReturnMode::Count
+            )
+        {
+            for doc_id in &base_ids {
+                if let Some(doc) = index.doc_by_id(*doc_id) {
+                    candidate_doc_ids.push(doc.doc_id);
+                    candidate_paths.push(doc.path.clone());
+                }
+            }
+            return Ok(SearchResponse {
+                matches: Vec::new(),
+                candidate_count,
+                used_fallback: false,
+                extracted_literals: Vec::new(),
+                base_generation,
+                overlay_generation,
+                candidate_doc_ids,
+                candidate_paths,
+                return_mode: options.return_mode,
+            });
         }
 
         for doc_id in base_ids {
@@ -574,7 +934,7 @@ impl Engine {
 
             if let Some(re) = regex.as_ref() {
                 scan_candidate(
-                    re,
+                    re.as_ref(),
                     &doc.path,
                     &bytes,
                     &mut out,
@@ -597,7 +957,7 @@ impl Engine {
                 };
                 if let (Some(re), OverlayEntry::Modified(file)) = (regex.as_ref(), entry) {
                     scan_candidate(
-                        re,
+                        re.as_ref(),
                         &path,
                         file.text.as_bytes(),
                         &mut out,
@@ -620,6 +980,9 @@ impl Engine {
             extracted_literals: Vec::new(),
             base_generation,
             overlay_generation,
+            candidate_doc_ids,
+            candidate_paths,
+            return_mode: options.return_mode,
         })
     }
 
@@ -874,6 +1237,42 @@ impl Engine {
         }
 
         posting_lists.sort_by_key(|list| list.len());
+
+        let doc_count = index.docs.len();
+        let total_len: usize = posting_lists.iter().map(|l| l.len()).sum();
+        if doc_count > 0 && total_len > doc_count * 2 && doc_count <= 1_000_000 {
+            let mut bitset = vec![0u64; (doc_count + 63) / 64];
+            for doc_id in &posting_lists[0] {
+                let idx = *doc_id as usize;
+                bitset[idx / 64] |= 1u64 << (idx % 64);
+            }
+            for posting in posting_lists.iter().skip(1) {
+                let mut next = vec![0u64; bitset.len()];
+                for doc_id in posting {
+                    let idx = *doc_id as usize;
+                    next[idx / 64] |= 1u64 << (idx % 64);
+                }
+                for (a, b) in bitset.iter_mut().zip(next.iter()) {
+                    *a &= *b;
+                }
+            }
+            let mut out = HashSet::new();
+            for (word_idx, word) in bitset.iter().enumerate() {
+                if *word == 0 {
+                    continue;
+                }
+                for bit in 0..64 {
+                    if (word & (1u64 << bit)) != 0 {
+                        let doc_id = word_idx * 64 + bit;
+                        if doc_id < doc_count {
+                            out.insert(doc_id as u32);
+                        }
+                    }
+                }
+            }
+            return Ok(out);
+        }
+
         let mut acc = posting_lists[0].clone();
         for posting in posting_lists.iter().skip(1) {
             acc = intersect_sorted_doc_ids(&acc, posting);
@@ -1078,6 +1477,48 @@ fn scan_candidate(
     Ok(())
 }
 
+fn scan_literal_candidate(
+    literal: &[u8],
+    path: &str,
+    bytes: &[u8],
+    out: &mut Vec<SearchMatch>,
+    max_results: usize,
+    deadline: Option<(Instant, u64)>,
+    request_id: &Option<String>,
+    include_snippet: bool,
+) -> Result<()> {
+    if literal.is_empty() {
+        return Ok(());
+    }
+
+    let line_starts = build_line_starts(bytes);
+    for start in memmem::find_iter(bytes, literal) {
+        check_deadline(deadline, request_id)?;
+        let end = start + literal.len();
+        let (line, column, snippet) = if include_snippet {
+            line_column_snippet(bytes, &line_starts, start)
+        } else {
+            let (line, column) = line_column_only(&line_starts, start);
+            (line, column, String::new())
+        };
+
+        out.push(SearchMatch {
+            path: path.to_string(),
+            byte_offset: start,
+            end_offset: end,
+            line,
+            column,
+            snippet,
+        });
+
+        if out.len() >= max_results {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
 fn build_line_starts(bytes: &[u8]) -> Vec<usize> {
     let mut starts = Vec::<usize>::new();
     starts.push(0);
@@ -1168,6 +1609,58 @@ impl HotCache {
             .iter()
             .filter_map(|path| self.map.get(path).map(|bytes| (path.clone(), bytes.clone())))
             .collect()
+    }
+}
+
+#[derive(Debug)]
+struct RegexCache {
+    cap: usize,
+    order: VecDeque<String>,
+    map: HashMap<String, Arc<Regex>>,
+}
+
+impl RegexCache {
+    fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            order: VecDeque::new(),
+            map: HashMap::new(),
+        }
+    }
+
+    fn get_or_build<F>(
+        &mut self,
+        key: &str,
+        case_sensitive: bool,
+        dotall: bool,
+        multiline: bool,
+        build: F,
+    ) -> Result<Arc<Regex>>
+    where
+        F: FnOnce() -> Result<Regex>,
+    {
+        let cache_key = format!("{}|{}|{}|{}", key, case_sensitive, dotall, multiline);
+        if let Some(found) = self.map.get(&cache_key).cloned() {
+            self.bump(&cache_key);
+            return Ok(found);
+        }
+
+        let regex = Arc::new(build()?);
+        if self.map.len() >= self.cap {
+            if let Some(old) = self.order.pop_front() {
+                self.map.remove(&old);
+            }
+        }
+        self.map.insert(cache_key.clone(), Arc::clone(&regex));
+        self.order.push_back(cache_key);
+        Ok(regex)
+    }
+
+    fn bump(&mut self, key: &str) {
+        if let Some(pos) = self.order.iter().position(|k| k == key) {
+            self.order.remove(pos);
+            self.order.push_back(key.to_string());
+        }
     }
 }
 

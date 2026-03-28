@@ -121,6 +121,17 @@ To optimize for literal, “surgical” searches from agents, pass:
 
 `literal=true` escapes regex metacharacters and forces a literal plan.
 
+### literal_search (no regex)
+
+Use for fast exact phrase searches without PCRE2:
+
+```json
+{
+  "pattern": "exact phrase here",
+  "no_snippet": true
+}
+```
+
 ### hash_search (binary / gram hashes)
 
 For IA-native binary queries, use `hash_search` with precomputed trigram hashes and optional literal verification:
@@ -131,6 +142,16 @@ For IA-native binary queries, use `hash_search` with precomputed trigram hashes 
   "logic": "and",
   "verify_literal": "TODO",
   "no_snippet": true
+}
+```
+
+To skip verification and return only candidates:
+
+```json
+{
+  "hashes": [123, 456, 789],
+  "logic": "and",
+  "return_mode": "ids"
 }
 ```
 
@@ -235,5 +256,5 @@ Example (video-generate):
 Example (openclaw):
 
 - Report: `benchmarks/results_real_openclaw.md`
-- Average speedup vs `rg`: **1.74x** (3 patterns, no_snippet=true, 10.5k indexed docs)
-- hash_search TODO: **5.76x** (`benchmarks/results_real_openclaw_hash_todo.md`)
+- Average speedup vs `rg`: **4.15x** (TODO only, no_snippet=true, 10.5k indexed docs)
+- hash_search TODO: **4.01x** (`benchmarks/results_real_openclaw_hash_todo.md`)

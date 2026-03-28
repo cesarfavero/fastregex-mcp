@@ -8,7 +8,7 @@ mod planner;
 mod sparse;
 
 pub use engine::{
-    Engine, EngineConfig, HashLogic, HashSearchOptions, IndexRebuildResult, IndexStatus,
+    Engine, EngineConfig, HashLogic, HashSearchOptions, IndexRebuildResult, IndexStatus, ReturnMode,
     OverlayUpdateResult, RebuildMode, RebuildState, SearchMatch, SearchOptions, SearchResponse,
 };
 pub use error::{FastRegexError, Result};
